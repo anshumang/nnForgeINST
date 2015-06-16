@@ -32,10 +32,26 @@
 #include "../convolution_layer.h"
 #include "../nn_types.h"
 
+#include <sys/time.h>
+
+#include "EvqueueManager.h"
+
 #define FEATURE_MAP_BLOCK_SIZE 4
 #define WINDOW_WIDTH_LOCAL 4
 #define MAX_BLOCK_SIZE 5
 #define MAX_WINDOW_WIDTH 10
+
+//extern EvqueueManager *evqm;
+__device__ unsigned long long int d_zero_clock[15]; 
+__device__ unsigned int d_yield_point, d_yield_point_persist, d_yield, d_yield_point_min;
+__device__ unsigned int d_clock_initialized[15];
+__device__ int d_elapsed, d_elapsed_min;
+unsigned int h_yield_point;
+int h_elapsed;
+unsigned int *d_yield_point_ret;
+int *d_elapsed_ret;
+
+unsigned int h_clock_initialized[15];
 
 namespace nnforge
 {
@@ -839,6 +855,283 @@ namespace nnforge
 			}
 		}
 
+    static __device__ __forceinline__ uint32_t __smid()
+    {
+	    uint32_t smid;
+	    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+	    return smid;
+    }
+ 
+		template<int DIMENSION_COUNT, int WINDOW_WIDTH>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_update_weights_exact_upd_kernel_kepler_instrumented(
+			float2 * __restrict gradient_weights,
+			cudaTextureObject_t input_tex,
+			cudaTextureObject_t output_tex,
+			const packed_config<DIMENSION_COUNT*2+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count,
+			int output_feature_map_count,
+			int input_feature_map_count_striped,
+			int output_feature_map_count_striped,
+			int input_elem_count_per_entry_striped,
+			int output_elem_count_per_entry_striped,
+			int entry_count,
+			int packed_config_count,
+			int last_dimension_group_count,/*)*/
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+                     #if 1
+                        __shared__ bool yield;
+                        int elapsed = 0;
+                        unsigned long long int start_clock = clock64();
+                        int mysmid = __smid();
+                        if(threadIdx.x == 0)
+                        {
+                           if(blockIdx.x + blockIdx.y * gridDim.x < 60)
+                           {
+                                
+                              if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
+                              {
+                                  atomicExch(&d_zero_clock[mysmid], start_clock);
+                                  atomicExch(&d_yield_point_min, 0x7fffffff);
+                                  atomicExch(&d_elapsed_min, 0x7fffffff);
+                                  yield = false;
+                              }
+                              else
+                              {
+				  elapsed = start_clock - d_zero_clock[mysmid];
+                                  if(elapsed < 1000) /*Less than 1 us should include all blocks in a dispatch set*/
+                                  {
+                                      yield = false;
+				      atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+				      atomicMax(&d_elapsed, elapsed);
+                                  }
+                                  else
+                                  {
+                                      atomicExch(&d_yield_point_min, 0x7fffffff);
+                                      atomicExch(&d_elapsed_min, 0x7fffffff);
+                                      yield = true;
+                                  }
+                              }
+                           }
+                           else
+                           {
+			      if(blockIdx.x + blockIdx.y * gridDim.x % 1000 == 0)
+			        printf("%d %d\n", blockIdx.x + blockIdx.y * gridDim.x, elapsed);
+			      if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
+                              {
+				      yield = true;
+                              }
+			      else
+                              {
+                                      /*if(d_yield == 1)
+                                      {
+                                          yield = true;
+                                      }
+                                      else
+                                      {
+                                          yield = false;
+                                      }*/
+                              
+				      elapsed = start_clock - d_zero_clock[mysmid];
+				      if(elapsed >= 10000000)
+				      {
+					      yield = true;
+					      atomicMin(&d_yield_point_min, blockIdx.x + blockIdx.y * gridDim.x);
+					      atomicMin(&d_elapsed_min, elapsed);
+				      }
+				      else
+				      {
+					      yield = false;
+					      atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					      atomicMax(&d_elapsed, elapsed);
+				      }
+                              
+                              }
+                              
+                              if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
+                              {
+                                  unsigned int val1 = atomicExch(&d_yield_point, 0);
+
+                                  if(val1 == gridDim.x * gridDim.y - 1)
+                                      atomicExch(&d_yield_point_persist, 0);
+                                  else
+                                      atomicExch(&d_yield_point_persist, val1);
+                                  
+                                  *d_ret1 = val1; 
+                                  unsigned int val2 = atomicExch(&d_elapsed, 0);
+                                  *d_ret2 = val2; 
+                                  unsigned int val3 = atomicExch(&d_yield_point_min, 0x7fffffff);
+                                  unsigned int val4 = atomicExch(&d_elapsed_min, 0x7fffffff);
+                                  printf("%d %d %d %d\n", val1, val3, val2, val4);
+				  for(int i=0; i<15; i++)
+				  {
+					  atomicExch(&d_clock_initialized[i],0);
+					  unsigned int val = atomicExch(&d_clock_initialized[i],0);
+				  }
+                              }
+                              
+                            }
+                        }
+                        __syncthreads();
+                        if(yield==true)
+                        {
+				return;                           
+                        }
+                      #endif
+
+			bool in_bounds = (packed_config_id < packed_config_count) && (entry_id < entry_count);
+			if (in_bounds)
+			{
+				packed_config<DIMENSION_COUNT*2+2> conf = packed_config_list[packed_config_id];
+				int weight_xyzw[DIMENSION_COUNT];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+					weight_xyzw[i] = conf.get_val(i);
+				int xyzw[DIMENSION_COUNT];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+					xyzw[i] = conf.get_val(i + DIMENSION_COUNT);
+
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+				{
+					int input_v = xyzw[i] + weight_xyzw[i] - left_zero_padding[i];
+					if ((unsigned int)input_v >= (unsigned int)input_sizes[i])
+						return;
+				}
+
+				int input_feature_map_striped_id = conf.get_val(DIMENSION_COUNT * 2);
+				int output_feature_map_striped_id = conf.get_val(DIMENSION_COUNT * 2 + 1);
+
+				int output_errors_offset = entry_id * output_feature_map_count_striped + output_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_errors_offset = output_errors_offset * output_sizes[i] + xyzw[i];
+
+				int input_elem_id = entry_id * input_feature_map_count_striped + input_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_elem_id = input_elem_id * input_sizes[i] + xyzw[i] + weight_xyzw[i] - left_zero_padding[i];
+
+				float sums[WINDOW_WIDTH * 4];
+				#pragma unroll
+				for(int i = 0; i < WINDOW_WIDTH * 4; ++i)
+					sums[i] = 0.0F;
+
+				int iteration_count_x = output_sizes[0];
+
+				int output_shift = last_dimension_group_count * output_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+					output_shift *= output_sizes[i];
+				output_shift -= iteration_count_x;
+
+				int input_shift = last_dimension_group_count * input_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+					input_shift *= input_sizes[i];
+				input_shift -= iteration_count_x + (WINDOW_WIDTH - 1);
+
+				int input_last = (DIMENSION_COUNT > 1 ? xyzw[DIMENSION_COUNT - 1] + weight_xyzw[DIMENSION_COUNT - 1] - left_zero_padding[DIMENSION_COUNT - 1] : 0);
+				for(int t = (DIMENSION_COUNT > 1 ? xyzw[DIMENSION_COUNT - 1] : 0); t < (DIMENSION_COUNT > 1 ? output_sizes[DIMENSION_COUNT - 1] : 1); t += (DIMENSION_COUNT > 1 ? last_dimension_group_count : 1))
+				{
+					bool b_fit_l = (DIMENSION_COUNT > 1 ? ((unsigned int)input_last < (unsigned int)input_sizes[DIMENSION_COUNT - 1]) : true);
+					int input_x = xyzw[0] + weight_xyzw[0] - left_zero_padding[0];
+
+					float2 input_buf[WINDOW_WIDTH];
+					#pragma unroll
+					for(int i = 1; i < WINDOW_WIDTH; ++i)
+					{
+						bool b_fit = b_fit_l && ((unsigned int)input_x < (unsigned int)input_sizes[0]);
+						input_buf[i] = tex1Dfetch<float2>(input_tex, b_fit ? input_elem_id : -1);
+						++input_x;
+						++input_elem_id;
+					}
+
+					#pragma unroll 4
+					for(int x = 0; x < iteration_count_x; ++x)
+					{
+						float2 output_error = tex1Dfetch<float2>(output_tex, output_errors_offset);
+
+						#pragma unroll
+						for(int i = 0; i < WINDOW_WIDTH - 1; ++i)
+							input_buf[i] = input_buf[i + 1];
+						bool b_fit = b_fit_l && ((unsigned int)input_x < (unsigned int)input_sizes[0]);
+						input_buf[WINDOW_WIDTH - 1] = tex1Dfetch<float2>(input_tex, b_fit ? input_elem_id : -1);
+
+						#pragma unroll
+						for(int j = 0; j < WINDOW_WIDTH; ++j)
+						{
+							sums[j * 4] += output_error.x * input_buf[j].x;
+							sums[j * 4 + 1] += output_error.x * input_buf[j].y;
+							sums[j * 4 + 2] += output_error.y * input_buf[j].x;
+							sums[j * 4 + 3] += output_error.y * input_buf[j].y;
+						}
+
+						++output_errors_offset;
+						++input_elem_id;
+						++input_x;
+					}
+
+					output_errors_offset += output_shift;
+					input_elem_id += input_shift;
+					input_last += last_dimension_group_count;
+				}
+
+				int output_feature_map_id = output_feature_map_striped_id * 2;
+				int weights_offset = output_feature_map_id * input_feature_map_count_striped + input_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					weights_offset = weights_offset * window_sizes[i] + weight_xyzw[i];
+				int weight_count_per_feature_map_pair = window_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					weight_count_per_feature_map_pair *= window_sizes[i];
+
+				#pragma unroll
+				for(int i = 0; i < 2; ++i)
+				{
+					if (output_feature_map_id + i < output_feature_map_count)
+					{
+						int weights_offset1 = weights_offset + i * (input_feature_map_count_striped * weight_count_per_feature_map_pair);
+						#pragma unroll
+						for(int k = 0; k < WINDOW_WIDTH; ++k)
+						{
+							int weights_offset3 = weights_offset1 + k;
+							float upd_val1 = sums[k * 4 + i * 2];
+							float upd_val2 = sums[k * 4 + i * 2 + 1];
+							atomicAdd((float *)(gradient_weights + weights_offset3), upd_val1);
+							atomicAdd((float *)(gradient_weights + weights_offset3) + 1, upd_val2);
+						}
+					}
+				}
+			}/*else{
+                                printf("%d %d %d\n", blockIdx.x, blockIdx.y, threadIdx.x);
+                        }*/
+                        /*
+                        if(threadIdx.x == 0)
+                        {
+                           elapsed = clock64() - d_zero_clock[mysmid];
+			   if(elapsed >= 10000000)
+			   {
+			       atomicExch(&d_yield, 1);
+			       atomicMin(&d_yield_point_min, blockIdx.x + blockIdx.y * gridDim.x);
+			       atomicMin(&d_elapsed_min, elapsed);
+			    }
+			    else
+			    {
+			       atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+			       atomicMax(&d_elapsed, elapsed);
+			    }
+                        }
+                        */
+		}
+
 		template<int DIMENSION_COUNT>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_update_weights_generic_upd_kernel_kepler(
@@ -992,8 +1285,235 @@ namespace nnforge
 			}
 		}
 
+		template<int DIMENSION_COUNT>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_update_weights_generic_upd_kernel_kepler_instrumented(
+			float2 * __restrict gradient_weights,
+			cudaTextureObject_t input_tex,
+			cudaTextureObject_t output_tex,
+			const packed_config<DIMENSION_COUNT*2+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count,
+			int output_feature_map_count,
+			int input_feature_map_count_striped,
+			int output_feature_map_count_striped,
+			int input_elem_count_per_entry_striped,
+			int output_elem_count_per_entry_striped,
+			int entry_count,
+			int packed_config_count,
+			int last_dimension_group_count,/*)*/
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+                     #if 1
+                        __shared__ bool yield;
+                        int elapsed = 0;
+                        unsigned long long int start_clock = clock64();
+                        int mysmid = __smid();
+                        if(threadIdx.x == 0)
+                        {
+                           if(blockIdx.x + blockIdx.y * gridDim.x < 60)
+                           {
+                                
+                              if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
+                              {
+                                  atomicExch(&d_zero_clock[mysmid], start_clock);
+                                  yield = false;
+                              }
+                              else
+                              {
+				  elapsed = start_clock - d_zero_clock[mysmid];
+                                  if(elapsed < 1000) /*Less than 1 us should include all blocks in a dispatch set*/
+                                  {
+                                      yield = false;
+				      atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+				      atomicMax(&d_elapsed, elapsed);
+                                  }
+                                  else
+                                  {
+                                      yield = true;
+                                  }
+                              }
+                           }
+                           else
+                           {
+			      if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
+                              {
+				      yield = true;
+                              }
+			      else
+                              {
+				      elapsed = start_clock - d_zero_clock[mysmid];
+				      if(elapsed >= 10000000)
+				      {
+					      yield = true;
+				      }
+				      else
+				      {
+					      yield = false;
+					      atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					      atomicMax(&d_elapsed, elapsed);
+				      }
+                              }
+                              if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
+                              {
+                                  unsigned int val = atomicExch(&d_yield_point, 0);
+                                  atomicExch(&d_yield_point_persist, val);
+                                  *d_ret1 = val; 
+                                  val = atomicExch(&d_elapsed, 0);
+                                  *d_ret2 = val; 
+				  for(int i=0; i<15; i++)
+				  {
+					  atomicExch(&d_clock_initialized[i],0);
+					  unsigned int val = atomicExch(&d_clock_initialized[i],0);
+				  }
+                              }
+                            }
+                        }
+                        __syncthreads();
+                        if(yield==true)
+                        {
+				return;                           
+                        }
+                      #endif
+
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+
+			bool in_bounds = (packed_config_id < packed_config_count) && (entry_id < entry_count);
+			if (in_bounds)
+			{
+				packed_config<DIMENSION_COUNT*2+2> conf = packed_config_list[packed_config_id];
+				int weight_xyzw[DIMENSION_COUNT];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+					weight_xyzw[i] = conf.get_val(i);
+				int xyzw[DIMENSION_COUNT];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+					xyzw[i] = conf.get_val(i + DIMENSION_COUNT);
+
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+				{
+					int input_v = xyzw[i] + weight_xyzw[i] - left_zero_padding[i];
+					if ((unsigned int)input_v >= (unsigned int)input_sizes[i])
+						return;
+				}
+
+				int input_feature_map_striped_id = conf.get_val(DIMENSION_COUNT * 2);
+				int output_feature_map_striped_id = conf.get_val(DIMENSION_COUNT * 2 + 1);
+
+				int output_errors_offset = entry_id * output_feature_map_count_striped + output_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_errors_offset = output_errors_offset * output_sizes[i] + xyzw[i];
+
+				int input_elem_id = entry_id * input_feature_map_count_striped + input_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_elem_id = input_elem_id * input_sizes[i] + xyzw[i] + weight_xyzw[i] - left_zero_padding[i];
+
+				float sums[WINDOW_WIDTH_LOCAL * 4];
+				#pragma unroll
+				for(int i = 0; i < WINDOW_WIDTH_LOCAL * 4; ++i)
+					sums[i] = 0.0F;
+
+				int iteration_count_x = output_sizes[0];
+
+				int output_shift = last_dimension_group_count * output_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+					output_shift *= output_sizes[i];
+				output_shift -= iteration_count_x;
+
+				int input_shift = last_dimension_group_count * input_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT - 1; ++i)
+					input_shift *= input_sizes[i];
+				input_shift -= (iteration_count_x + (WINDOW_WIDTH_LOCAL - 1));
+
+				int input_last = (DIMENSION_COUNT > 1 ? xyzw[DIMENSION_COUNT - 1] + weight_xyzw[DIMENSION_COUNT - 1] - left_zero_padding[DIMENSION_COUNT - 1] : 0);
+				for(int t = (DIMENSION_COUNT > 1 ? xyzw[DIMENSION_COUNT - 1] : 0); t < (DIMENSION_COUNT > 1 ? output_sizes[DIMENSION_COUNT - 1] : 1); t += (DIMENSION_COUNT > 1 ? last_dimension_group_count : 1))
+				{
+					bool b_fit_l = (DIMENSION_COUNT > 1 ? ((unsigned int)input_last < (unsigned int)input_sizes[DIMENSION_COUNT - 1]) : true);
+					int input_x = xyzw[0] + weight_xyzw[0] - left_zero_padding[0];
+
+					float2 input_buf[WINDOW_WIDTH_LOCAL];
+					#pragma unroll
+					for(int i = 1; i < WINDOW_WIDTH_LOCAL; ++i)
+					{
+						bool b_fit = b_fit_l && ((unsigned int)input_x < (unsigned int)input_sizes[0]);
+						input_buf[i] = tex1Dfetch<float2>(input_tex, b_fit ? input_elem_id : -1);
+						++input_x;
+						++input_elem_id;
+					}
+
+					#pragma unroll 4
+					for(int x = 0; x < iteration_count_x; ++x)
+					{
+						float2 output_error = tex1Dfetch<float2>(output_tex, output_errors_offset);
+
+						#pragma unroll
+						for(int i = 0; i < WINDOW_WIDTH_LOCAL - 1; ++i)
+							input_buf[i] = input_buf[i + 1];
+						bool b_fit = b_fit_l && ((unsigned int)input_x < (unsigned int)input_sizes[0]);
+						input_buf[WINDOW_WIDTH_LOCAL - 1] = tex1Dfetch<float2>(input_tex, b_fit ? input_elem_id : -1);
+
+						#pragma unroll
+						for(int j = 0; j < WINDOW_WIDTH_LOCAL; ++j)
+						{
+							sums[j * 4] += output_error.x * input_buf[j].x;
+							sums[j * 4 + 1] += output_error.x * input_buf[j].y;
+							sums[j * 4 + 2] += output_error.y * input_buf[j].x;
+							sums[j * 4 + 3] += output_error.y * input_buf[j].y;
+						}
+
+						output_errors_offset++;
+						input_elem_id++;
+						++input_x;
+					}
+
+					output_errors_offset += output_shift;
+					input_elem_id += input_shift;
+					input_last += last_dimension_group_count;
+				}
+
+				int output_feature_map_id = output_feature_map_striped_id * 2;
+				int weights_offset = output_feature_map_id * input_feature_map_count_striped + input_feature_map_striped_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					weights_offset = weights_offset * window_sizes[i] + weight_xyzw[i];
+				int weight_count_per_feature_map_pair = window_sizes[0];
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					weight_count_per_feature_map_pair *= window_sizes[i];
+
+				#pragma unroll
+				for(int i = 0; i < 2; ++i)
+				{
+					if (output_feature_map_id + i < output_feature_map_count)
+					{
+						int weights_offset1 = weights_offset + i * (input_feature_map_count_striped * weight_count_per_feature_map_pair);
+						#pragma unroll
+						for(int k = 0; k < WINDOW_WIDTH_LOCAL; ++k)
+						{
+							if (k < window_sizes[0] - weight_xyzw[0])
+							{
+								int weights_offset3 = weights_offset1 + k;
+								float upd_val1 = sums[k * 4 + i * 2];
+								float upd_val2 = sums[k * 4 + i * 2 + 1];
+								atomicAdd((float *)(gradient_weights + weights_offset3), upd_val1);
+								atomicAdd((float *)(gradient_weights + weights_offset3) + 1, upd_val2);
+							}
+						}
+					}
+				}
+			}
+		}
 #define launch_exact_kernel_const_const_const_const(dimension_count_const, window_width_const, block_size_const, single_input_feature_map_group_count_const) \
 	convolution_tex_exact_blocked_upd_kernel_kepler<dimension_count_const,window_width_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
+	//convolution_tex_exact_blocked_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
 
 #define launch_generic_kernel_const_const_const(dimension_count_const, block_size_const, single_input_feature_map_group_count_const) \
 	convolution_tex_generic_blocked_upd_kernel_kepler<dimension_count_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
@@ -1146,8 +1666,14 @@ namespace nnforge
 #define launch_update_exact_kernel_const_const(dimension_count_const, window_width_const) \
 	convolution_update_weights_exact_upd_kernel_kepler<dimension_count_const,window_width_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count);
 
+#define launch_update_exact_kernel_const_const_instrumented(dimension_count_const, window_width_const) \
+	convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, d_yield_point_ret, d_elapsed_ret);
+
 #define launch_update_generic_kernel_const(dimension_count_const) \
 	convolution_update_weights_generic_upd_kernel_kepler<dimension_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count);
+
+#define launch_update_generic_kernel_const_instrumented(dimension_count_const) \
+	convolution_update_weights_generic_upd_kernel_kepler_instrumented<dimension_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, d_yield_point_ret, d_elapsed_ret);
 
 #define launch_update_kernel(dimension_count_const, window_width) \
 	switch (window_width) \
@@ -1184,6 +1710,44 @@ namespace nnforge
 			break; \
 		default: \
 			launch_update_generic_kernel_const(dimension_count_const); \
+			break; \
+		};
+
+#define launch_update_kernel_instrumented(dimension_count_const, window_width) \
+	switch (window_width) \
+		{ \
+		case 1: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 1); \
+			break; \
+		case 2: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 2); \
+			break; \
+		case 3: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 3); \
+			break; \
+		case 4: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 4); \
+			break; \
+		case 5: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 5); \
+			break; \
+		case 6: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 6); \
+			break; \
+		case 7: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 7); \
+			break; \
+		case 8: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 8); \
+			break; \
+		case 9: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 9); \
+			break; \
+		case 10: \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 10); \
+			break; \
+		default: \
+			launch_update_generic_kernel_const_instrumented(dimension_count_const); \
 			break; \
 		};
 
@@ -1248,6 +1812,11 @@ namespace nnforge
 
 				bool single_input_feature_map_group_count = (forward_input_feature_map_group_count == 1);
 
+                                unsigned long grid[3], block[3];
+                                grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
+                                block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
+                                KernelIdentifier kid("convolution_tex_exact_blocked_upd_kernel_kepler", grid, block);
+                                EvqueueLaunch(kid);
 				launch_kernel(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count);
 			}
 
@@ -1294,6 +1863,11 @@ namespace nnforge
 
 				bool single_output_feature_map_group_count = (backward_output_feature_map_group_count == 1);
 
+                                unsigned long grid[3], block[3];
+                                grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
+                                block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
+                                KernelIdentifier kid("convolution_backprop_tex_exact_blocked_upd_kernel_kepler", grid, block);
+                                EvqueueLaunch(kid);
 				launch_backprop_kernel(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count);
 			}
 
@@ -1355,8 +1929,56 @@ namespace nnforge
 					updater_packed_config_count,
 					entry_count,
 					1);
+                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_elapsed_ret, sizeof(int));
 
+                                //struct timeval start, end;
+                                unsigned long grid[3], block[3];
+                                grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
+                                block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
+                                KernelIdentifier kid("convolution_update_weights_exact_upd_kernel_kepler", grid, block);
+                                //evqm->launch(kid);
+                                EvqueueLaunch(kid);
+                                //kernel_dims.first.x = 120; kernel_dims.first.y = 1;
+
+                                //cudaMemcpyToSymbol(&d_yield_point, &h_yield_point, sizeof(unsigned int), 0, cudaMemcpyHostToDevice);
+                                for(int i=0; i<15; i++)
+                                {
+                                    h_clock_initialized[i] = 0;
+                                }
+                                std::cout << "Window width " << window_sizes[0] << std::endl;
+                                struct timeval start, end;
+                                cudaDeviceSynchronize();
+                                gettimeofday(&start, NULL);
 				launch_update_kernel(dimension_count, window_sizes[0]);
+                                cudaDeviceSynchronize();
+                                gettimeofday(&end, NULL);
+                                std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                unsigned int launch_ctr = 0;
+                                cudaDeviceSynchronize();
+                                gettimeofday(&start, NULL);
+				launch_update_kernel_instrumented(dimension_count, window_sizes[0]);
+                                launch_ctr++;
+                                //convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count,3><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count); 
+                                cudaDeviceSynchronize();
+                                gettimeofday(&end, NULL);
+                                std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                                cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+                                //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << std::endl;
+                                while(h_yield_point < grid[0]*grid[1]-1)
+                                {
+                                    gettimeofday(&start, NULL);
+                                    cudaDeviceSynchronize();
+                                    launch_update_kernel_instrumented(dimension_count, window_sizes[0]);
+				    launch_ctr++;
+                                    cudaDeviceSynchronize();
+                                    gettimeofday(&end, NULL);
+                                    std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                    cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                                    cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+				    //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << std::endl;
+                                }
 			}
 
 		protected:

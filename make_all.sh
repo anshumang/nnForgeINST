@@ -2,18 +2,18 @@
 mkdir -p lib
 mkdir -p bin
 cd nnforge
-make $@
+make -j12 $@
 cd plain
-make $@
+make -j12 $@
 cd ../cuda
-make $@
+make -j12 $@
 cd ../..
 cd examples
 for i in ./*
 do
 	if [ -d "$i" ];then
 		cd $i
-		make $@
+		make -j12 $@
 		cd ..
 	fi
 done
@@ -23,7 +23,7 @@ for i in ./*
 do
 	if [ -d "$i" ];then
 		cd $i
-		make $@
+		make -j12 $@
 		cd ..
 	fi
 done

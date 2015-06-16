@@ -11,15 +11,15 @@ endif
 
 ifeq ($(USE_BOOST),yes)
 ifneq ($(CPP11COMPILER),yes)
-GENERIC_CXXFLAGS+=-I$(BOOST_PATH)/include/boost/tr1/tr1
+GENERIC_CXXFLAGS+=-I$(BOOST_INC_PATH)/boost/tr1/tr1
 endif
-GENERIC_CXXFLAGS+=-I$(BOOST_PATH)/include
-LDFLAGS+=-L$(BOOST_PATH)/lib $(BOOST_LIBS)
+GENERIC_CXXFLAGS+=-I$(BOOST_INC_PATH)/boost
+LDFLAGS+=-L$(BOOST_LIB_PATH) $(BOOST_LIBS)
 endif
 
 ifeq ($(USE_PROTOBUF),yes)
-GENERIC_CXXFLAGS+=-I$(PROTOBUF_PATH)/include
-LDFLAGS+=-L$(PROTOBUF_PATH)/lib $(PROTOBUF_LIBS)
+GENERIC_CXXFLAGS+=-I$(PROTOBUF_INC_PATH)
+LDFLAGS+=-L$(PROTOBUF_LIB_PATH) $(PROTOBUF_LIBS)
 endif
 
 ifeq ($(USE_NETCDF),yes)
@@ -39,13 +39,13 @@ LDFLAGS+=$(MATIO_LIBS)
 endif
 
 ifeq ($(USE_CUDA),yes)
-GENERIC_CXXFLAGS+=-I$(CUDA_PATH)/include -I$(CUDNN_PATH)
-LDFLAGS+=-L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib -L$(CUDNN_PATH) $(CUDA_LIBS)
+GENERIC_CXXFLAGS+=-I$(CUDA_PATH)/include -I$(CUDNN_PATH) -I/usr/local/cuda/extras/CUPTI/include
+LDFLAGS+=-L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib -L$(CUDNN_PATH) $(CUDA_LIBS) -L/usr/local/cuda/extras/CUPTI/lib64 -lcupti
 endif
 
 ifeq ($(USE_OPENCV),yes)
-GENERIC_CXXFLAGS+=-I$(OPENCV_PATH)/include
-LDFLAGS+=-L$(OPENCV_PATH)/lib $(OPENCV_LIBS)
+GENERIC_CXXFLAGS+=-I$(OPENCV_INC_PATH)/opencv
+LDFLAGS+=-L$(OPENCV_LIB_PATH) $(OPENCV_LIBS)
 endif
 
 ifeq ($(USE_OPENMP),yes)
@@ -81,6 +81,10 @@ NVCCFLAGS+=-DNNFORGE_CPP11COMPILER -std=c++11
 CXXFLAGS+=$(CPP_FLAGS_CPP11)
 CXXFLAGS+=-DNNFORGE_CPP11COMPILER
 endif
+
+CXXFLAGS+=-I/usr/local/cuda/extras/CUPTI/include -I/opt/data1/share/users/anshuman/evqueue-core/include -I/opt/data1/share/users/anshuman/nanomsg/src
+
+LDFLAGS+=-L/usr/local/cuda/extras/CUPTI/lib64 -lcupti /opt/data1/share/users/anshuman/evqueue-core/build-nanomsg/libevqueue_client.so
 
 ARFLAGS=rcvus
 

@@ -16,14 +16,14 @@ OBJECTS_CUDA=$(SOURCES_CUDA:%.cu=%.o)
 all: $(TARGET)
 
 %.o : %.cu
-	$(NVCC) -c $< $(NVCCFLAGS) $(CUDA_FLAGS_ARCH) -o $@
+	$(NVCC) -c $< $(NVCCFLAGS) $(CUDA_FLAGS_ARCH) -I/opt/data1/share/users/anshuman/evqueue-core/include -I/opt/data1/share/users/anshuman/nanomsg/src -o $@
 
 $(OBJECTS): $(SOURCES)
 
 $(OBJECTS_CUDA): $(SOURCES_CUDA)
 
 $(TARGET): $(OBJECTS) $(OBJECTS_CUDA)
-	$(AR) $(ARFLAGS) $(TARGET) $(OBJECTS) $(OBJECTS_CUDA)
+	$(AR) $(ARFLAGS) $(TARGET) $(OBJECTS) $(OBJECTS_CUDA) /opt/data1/share/users/anshuman/evqueue-core/build-nanomsg/libevqueue_client.so
 
 clean:
 	$(RM) $(OBJECTS) $(OBJECTS_CUDA) $(TARGET)

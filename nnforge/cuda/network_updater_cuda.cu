@@ -36,6 +36,26 @@
 #include "../debug_util.h"
 #include <boost/filesystem.hpp>
 
+#include <sys/time.h>
+#include "EvqueueManager.h"
+#if 0
+#include <cupti.h>
+
+#define CUPTI_CALL(call)                                                \
+  do {                                                                  \
+    CUptiResult _status = call;                                         \
+    if (_status != CUPTI_SUCCESS) {                                     \
+      const char *errstr;                                               \
+      cuptiGetResultString(_status, &errstr);                           \
+      fprintf(stderr, "%s:%d: error: function %s failed with error %s.\n", \
+              __FILE__, __LINE__, #call, errstr);                       \
+      exit(-1);                                                         \
+    }                                                                   \
+  } while (0)
+#endif
+
+//EvqueueManager *evqm;
+
 namespace nnforge
 {
 	namespace cuda
@@ -495,6 +515,8 @@ namespace nnforge
 			unsigned int gradient_applied_count = 0;
 			while((entries_available_for_copy_in_count > 0) || (entries_available_for_processing_count > 0))
 			{
+                                struct timeval start, end;
+				gettimeofday(&start, NULL);
 				supervised_data_reader_async_helper async_reader;
 				if (entries_available_for_copy_in_count > 0)
 				{
@@ -559,8 +581,13 @@ namespace nnforge
 					}
 
 					unsigned int base_input_entry_id = 0;
+                                        //CUPTI_CALL(cuptiActivityFlushAll(0));
+				        //gettimeofday(&end, NULL);
+                                        //std::cout << "Outer total I : " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
 					while(base_input_entry_id < entries_available_for_processing_count)
 					{
+                                                struct timeval start1, end1;
+                                                gettimeofday(&start1, NULL);
 						std::stack<unsigned int> offset_list;
 
 						unsigned int current_updater_entry_count = std::min(std::min(entries_available_for_processing_count - base_input_entry_id, updater_entry_count), batch_size - entry_gradient_calculated_count);
@@ -752,7 +779,12 @@ namespace nnforge
 							cuda_safe_call(cudaEventRecord(data_processed_event, *command_stream));
 							cuda_safe_call(cudaEventQuery(data_processed_event));
 						}
+                                                //CUPTI_CALL(cuptiActivityFlushAll(0));
+						gettimeofday(&end1, NULL);
+                                                //std::cout << (end1.tv_sec - start1.tv_sec)*1000000 + (end1.tv_usec - start1.tv_usec) << std::endl;
+						EvqueueSynch();
 					} // while(base_input_entry_id < entries_available_for_processing_count)
+                                        //gettimeofday(&start, NULL);
 
 					entries_processed_count += entries_available_for_processing_count;
 
@@ -775,6 +807,10 @@ namespace nnforge
 
 				current_data_slot = 1 - current_data_slot;
 				current_command_slot = 1 - current_command_slot;
+                                //evqm->synch();
+                                EvqueueSynch();
+				gettimeofday(&end, NULL);
+                                std::cerr << "[NN] ------ " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
 			}
 
 			if (entry_gradient_calculated_count > 0)

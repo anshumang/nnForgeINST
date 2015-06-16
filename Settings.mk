@@ -1,22 +1,25 @@
-BUILD_MODE=release
+BUILD_MODE=debug
 ENABLE_CUDA_BACKEND=yes
-ENABLE_CUDA_PROFILING=no
+ENABLE_CUDA_PROFILING=yes
 CPP11COMPILER=no
-PROTOBUF_PATH=/usr
-BOOST_PATH=/usr
-OPENCV_PATH=/usr
-NETCDF_INSTALLED=yes
+PROTOBUF_INC_PATH=/usr/include
+PROTOBUF_LIB_PATH=/usr/lib/x86_64-linux-gnu
+BOOST_LIB_PATH=/usr/lib/x86_64-linux-gnu
+OPENCV_LIB_PATH=/usr/lib/x86_64-linux-gnu
+BOOST_INC_PATH=/usr/include
+OPENCV_INC_PATH=/usr/include
+NETCDF_INSTALLED=no
 NETCDF_PATH=
-MATIO_INSTALLED=yes
+MATIO_INSTALLED=no
 MATIO_PATH=
-CUDNN_PATH=/usr/local/cuDNN
+CUDNN_PATH=/opt/data1/share/users/anshuman/cudnn-6.5-linux-x64-v2-rc2/
 CUDA_PATH=/usr/local/cuda
 NVCC=nvcc
 PROTOC=protoc
 CUDA_FLAGS_ARCH=-gencode=arch=compute_30,code=sm_30 -gencode=arch=compute_35,code=\"sm_35,compute_35\"
 NNFORGE_PATH=../..
-NNFORGE_INPUT_DATA_PATH=/home/max/nnforge/input_data
-NNFORGE_WORKING_DATA_PATH=/home/max/nnforge/working_data
+NNFORGE_INPUT_DATA_PATH=/opt/data1/share/users/anshuman
+NNFORGE_WORKING_DATA_PATH=/opt/data1/share/users/anshuman
 
 PROTOBUF_LIBS=-lprotobuf
 BOOST_LIBS=-lboost_thread -lboost_regex -lboost_chrono -lboost_filesystem -lboost_program_options -lboost_random -lboost_system -lboost_date_time

@@ -33,6 +33,9 @@ namespace nnforge
 
 			switch (output_configuration_specific.dimension_sizes.size()) 
 			{
+				case 2:
+					res = layer_updater_cuda_smart_ptr(new convolution_layer_updater_cuda_kepler<2>());
+					break;
 				case 3:
 					res = layer_updater_cuda_smart_ptr(new convolution_layer_updater_cuda_kepler<3>());
 					break;

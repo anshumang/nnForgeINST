@@ -67,7 +67,7 @@ namespace nnforge
 			{
 				res = layer_tester_cuda_smart_ptr(new convolution_1x1_layer_tester_cuda());
 			}
-			else if (input_configuration_specific.dimension_sizes.size() <= 2)
+			else if (input_configuration_specific.dimension_sizes.size() <= 0) /*2 : cuDNN*/
 			{
 				res = layer_tester_cuda_smart_ptr(new convolution_layer_tester_cuda());
 			}
