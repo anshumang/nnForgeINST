@@ -43,13 +43,14 @@
 
 //extern EvqueueManager *evqm;
 __device__ unsigned long long int d_zero_clock[15]; 
-__device__ unsigned int d_yield_point, d_yield_point_persist, d_yield, d_yield_point_min;
+__device__ unsigned int d_yield_point, d_yield_point_persist, d_yield;
 __device__ unsigned int d_clock_initialized[15];
-__device__ int d_elapsed, d_elapsed_min;
+__device__ int d_elapsed;
 unsigned int h_yield_point;
 int h_elapsed;
 unsigned int *d_yield_point_ret;
 int *d_elapsed_ret;
+int counts_three, allocate;
 
 unsigned int h_clock_initialized[15];
 
@@ -862,6 +863,90 @@ namespace nnforge
 	    return smid;
     }
  
+    static __device__ __forceinline__ uint32_t yield(unsigned int *d_ret1, int *d_ret2, unsigned int allotted_slice)
+    {
+	    __shared__ bool yield;
+	    int elapsed = 0;
+	    unsigned long long int start_clock = clock64();
+	    int mysmid = __smid();
+	    if(threadIdx.x == 0)
+	    {
+		    if(blockIdx.x + blockIdx.y * gridDim.x < 60)
+		    {
+
+			    if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
+			    {
+				    atomicExch(&d_zero_clock[mysmid], start_clock);
+				    yield = false;
+			    }
+			    else
+			    {
+				    elapsed = start_clock - d_zero_clock[mysmid];
+				    if(elapsed < 1000) /*Less than 1 us should include all blocks in a dispatch set*/
+				    {
+					    yield = false;
+					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					    atomicMax(&d_elapsed, elapsed);
+				    }
+				    else
+				    {
+					    yield = true;
+				    }
+			    }
+		    }
+		    else
+		    {
+			    if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
+			    {
+				    yield = true;
+			    }
+			    else
+			    {
+				    elapsed = start_clock - d_zero_clock[mysmid];
+				    if(elapsed >= allotted_slice/*20000000*/)
+				    {
+					    yield = true;
+				    }
+				    else
+				    {
+					    yield = false;
+					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					    atomicMax(&d_elapsed, elapsed);
+				    }
+
+			    }
+
+			    if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
+			    {
+				    unsigned int val = atomicExch(&d_yield_point, 0);
+
+				    if(val == gridDim.x * gridDim.y - 1)
+					    atomicExch(&d_yield_point_persist, 0);
+				    else
+					    atomicExch(&d_yield_point_persist, val);
+
+				    *d_ret1 = val; 
+				    val = atomicExch(&d_elapsed, 0);
+				    *d_ret2 = val; 
+				    for(int i=0; i<15; i++)
+				    {
+					    atomicExch(&d_clock_initialized[i],0);
+					    unsigned int val = atomicExch(&d_clock_initialized[i],0);
+				    }
+			    }
+
+		    }
+	    }
+	    __syncthreads();
+	    if(yield==true)
+	    {
+		    return true;                           
+	    }
+            else
+            {
+                    return false;
+            }
+   }
 		template<int DIMENSION_COUNT, int WINDOW_WIDTH>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_update_weights_exact_upd_kernel_kepler_instrumented(
@@ -882,12 +967,13 @@ namespace nnforge
 			int entry_count,
 			int packed_config_count,
 			int last_dimension_group_count,/*)*/
+                        unsigned long allotted_slice,
                         unsigned int *d_ret1,
                         int *d_ret2)
 		{
 			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
 			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
-                     #if 1
+                     #if 0
                         __shared__ bool yield;
                         int elapsed = 0;
                         unsigned long long int start_clock = clock64();
@@ -900,8 +986,6 @@ namespace nnforge
                               if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
                               {
                                   atomicExch(&d_zero_clock[mysmid], start_clock);
-                                  atomicExch(&d_yield_point_min, 0x7fffffff);
-                                  atomicExch(&d_elapsed_min, 0x7fffffff);
                                   yield = false;
                               }
                               else
@@ -915,16 +999,14 @@ namespace nnforge
                                   }
                                   else
                                   {
-                                      atomicExch(&d_yield_point_min, 0x7fffffff);
-                                      atomicExch(&d_elapsed_min, 0x7fffffff);
                                       yield = true;
                                   }
                               }
                            }
                            else
                            {
-			      if(blockIdx.x + blockIdx.y * gridDim.x % 1000 == 0)
-			        printf("%d %d\n", blockIdx.x + blockIdx.y * gridDim.x, elapsed);
+			      //if(blockIdx.x + blockIdx.y * gridDim.x % 1000 == 0)
+			        //printf("%d %d\n", blockIdx.x + blockIdx.y * gridDim.x, elapsed);
 			      if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
                               {
 				      yield = true;
@@ -941,11 +1023,9 @@ namespace nnforge
                                       }*/
                               
 				      elapsed = start_clock - d_zero_clock[mysmid];
-				      if(elapsed >= 10000000)
+				      if(elapsed >= allotted_slice/*20000000*/)
 				      {
 					      yield = true;
-					      atomicMin(&d_yield_point_min, blockIdx.x + blockIdx.y * gridDim.x);
-					      atomicMin(&d_elapsed_min, elapsed);
 				      }
 				      else
 				      {
@@ -958,19 +1038,16 @@ namespace nnforge
                               
                               if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
                               {
-                                  unsigned int val1 = atomicExch(&d_yield_point, 0);
+                                  unsigned int val = atomicExch(&d_yield_point, 0);
 
-                                  if(val1 == gridDim.x * gridDim.y - 1)
+                                  if(val == gridDim.x * gridDim.y - 1)
                                       atomicExch(&d_yield_point_persist, 0);
                                   else
-                                      atomicExch(&d_yield_point_persist, val1);
+                                      atomicExch(&d_yield_point_persist, val);
                                   
-                                  *d_ret1 = val1; 
-                                  unsigned int val2 = atomicExch(&d_elapsed, 0);
-                                  *d_ret2 = val2; 
-                                  unsigned int val3 = atomicExch(&d_yield_point_min, 0x7fffffff);
-                                  unsigned int val4 = atomicExch(&d_elapsed_min, 0x7fffffff);
-                                  printf("%d %d %d %d\n", val1, val3, val2, val4);
+                                  *d_ret1 = val; 
+                                  val = atomicExch(&d_elapsed, 0);
+                                  *d_ret2 = val; 
 				  for(int i=0; i<15; i++)
 				  {
 					  atomicExch(&d_clock_initialized[i],0);
@@ -986,6 +1063,8 @@ namespace nnforge
 				return;                           
                         }
                       #endif
+                      if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
 
 			bool in_bounds = (packed_config_id < packed_config_count) && (entry_id < entry_count);
 			if (in_bounds)
@@ -1120,8 +1199,6 @@ namespace nnforge
 			   if(elapsed >= 10000000)
 			   {
 			       atomicExch(&d_yield, 1);
-			       atomicMin(&d_yield_point_min, blockIdx.x + blockIdx.y * gridDim.x);
-			       atomicMin(&d_elapsed_min, elapsed);
 			    }
 			    else
 			    {
@@ -1305,6 +1382,7 @@ namespace nnforge
 			int entry_count,
 			int packed_config_count,
 			int last_dimension_group_count,/*)*/
+                        unsigned long allotted_slice,
                         unsigned int *d_ret1,
                         int *d_ret2)
 		{
@@ -1666,14 +1744,14 @@ namespace nnforge
 #define launch_update_exact_kernel_const_const(dimension_count_const, window_width_const) \
 	convolution_update_weights_exact_upd_kernel_kepler<dimension_count_const,window_width_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count);
 
-#define launch_update_exact_kernel_const_const_instrumented(dimension_count_const, window_width_const) \
-	convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, d_yield_point_ret, d_elapsed_ret);
+#define launch_update_exact_kernel_const_const_instrumented(dimension_count_const, window_width_const, allotted_slice) \
+	convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, allotted_slice, d_yield_point_ret, d_elapsed_ret);
 
 #define launch_update_generic_kernel_const(dimension_count_const) \
 	convolution_update_weights_generic_upd_kernel_kepler<dimension_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count);
 
-#define launch_update_generic_kernel_const_instrumented(dimension_count_const) \
-	convolution_update_weights_generic_upd_kernel_kepler_instrumented<dimension_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, d_yield_point_ret, d_elapsed_ret);
+#define launch_update_generic_kernel_const_instrumented(dimension_count_const, allotted_slice) \
+	convolution_update_weights_generic_upd_kernel_kepler_instrumented<dimension_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count, allotted_slice, d_yield_point_ret, d_elapsed_ret);
 
 #define launch_update_kernel(dimension_count_const, window_width) \
 	switch (window_width) \
@@ -1713,41 +1791,41 @@ namespace nnforge
 			break; \
 		};
 
-#define launch_update_kernel_instrumented(dimension_count_const, window_width) \
+#define launch_update_kernel_instrumented(dimension_count_const, window_width, allotted_slice) \
 	switch (window_width) \
 		{ \
 		case 1: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 1); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 1, allotted_slice); \
 			break; \
 		case 2: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 2); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 2, allotted_slice); \
 			break; \
 		case 3: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 3); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 3, allotted_slice); \
 			break; \
 		case 4: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 4); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 4, allotted_slice); \
 			break; \
 		case 5: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 5); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 5, allotted_slice); \
 			break; \
 		case 6: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 6); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 6, allotted_slice); \
 			break; \
 		case 7: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 7); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 7, allotted_slice); \
 			break; \
 		case 8: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 8); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 8, allotted_slice); \
 			break; \
 		case 9: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 9); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 9, allotted_slice); \
 			break; \
 		case 10: \
-			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 10); \
+			launch_update_exact_kernel_const_const_instrumented(dimension_count_const, 10, allotted_slice); \
 			break; \
 		default: \
-			launch_update_generic_kernel_const_instrumented(dimension_count_const); \
+			launch_update_generic_kernel_const_instrumented(dimension_count_const, allotted_slice); \
 			break; \
 		};
 
@@ -1816,7 +1894,7 @@ namespace nnforge
                                 grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_tex_exact_blocked_upd_kernel_kepler", grid, block);
-                                EvqueueLaunch(kid);
+                                //EvqueueLaunch(kid, 0);
 				launch_kernel(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count);
 			}
 
@@ -1867,7 +1945,7 @@ namespace nnforge
                                 grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_backprop_tex_exact_blocked_upd_kernel_kepler", grid, block);
-                                EvqueueLaunch(kid);
+                                //EvqueueLaunch(kid, 0);
 				launch_backprop_kernel(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count);
 			}
 
@@ -1929,56 +2007,75 @@ namespace nnforge
 					updater_packed_config_count,
 					entry_count,
 					1);
-                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
-                                cudaMalloc(&d_elapsed_ret, sizeof(int));
-
-                                //struct timeval start, end;
                                 unsigned long grid[3], block[3];
                                 grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
+                                //std::cout << grid[0] << " " << grid[1] << " " << std::endl;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_update_weights_exact_upd_kernel_kepler", grid, block);
-                                //evqm->launch(kid);
-                                EvqueueLaunch(kid);
-                                //kernel_dims.first.x = 120; kernel_dims.first.y = 1;
+                                //EvqueueLaunch(kid);
 
-                                //cudaMemcpyToSymbol(&d_yield_point, &h_yield_point, sizeof(unsigned int), 0, cudaMemcpyHostToDevice);
-                                for(int i=0; i<15; i++)
-                                {
-                                    h_clock_initialized[i] = 0;
-                                }
-                                std::cout << "Window width " << window_sizes[0] << std::endl;
                                 struct timeval start, end;
-                                cudaDeviceSynchronize();
-                                gettimeofday(&start, NULL);
-				launch_update_kernel(dimension_count, window_sizes[0]);
-                                cudaDeviceSynchronize();
-                                gettimeofday(&end, NULL);
-                                std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
-                                unsigned int launch_ctr = 0;
-                                cudaDeviceSynchronize();
-                                gettimeofday(&start, NULL);
-				launch_update_kernel_instrumented(dimension_count, window_sizes[0]);
-                                launch_ctr++;
+                                //cudaDeviceSynchronize();
+                                //gettimeofday(&start, NULL);
+				//launch_update_kernel(dimension_count, window_sizes[0]);
+                                //cudaDeviceSynchronize();
+                                //gettimeofday(&end, NULL);
+                                //std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                
                                 //convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count,3><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count); 
-                                cudaDeviceSynchronize();
-                                gettimeofday(&end, NULL);
-                                std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
-                                cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                                cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-                                //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << std::endl;
+
+                                unsigned int launch_ctr = 0;
+
+                                if(allocate == 0)
+                                {
+                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_elapsed_ret, sizeof(int));
+                                allocate = 1;
+                                }
+
+                                /*if((grid[0]==384)&&(counts_three<3))
+                                {
+                                   counts_three++;
+                                }*/
+                                unsigned long have_run_for=0;
+
+                                //if((grid[0]==12)||(grid[0]==48)||(grid[0]==96)||(grid[0]==192)||(counts_three==3))
+                                //{
+                                    //if(counts_three == 3)
+                                       //counts_three = 0;
                                 while(h_yield_point < grid[0]*grid[1]-1)
                                 {
-                                    gettimeofday(&start, NULL);
-                                    cudaDeviceSynchronize();
-                                    launch_update_kernel_instrumented(dimension_count, window_sizes[0]);
-				    launch_ctr++;
-                                    cudaDeviceSynchronize();
-                                    gettimeofday(&end, NULL);
-                                    std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                    //cudaDeviceSynchronize();
+                                    //EvqueueLaunch(kid, have_run_for);
+                                    unsigned long allotted_slice=10000000000; //10s, surely can't exceed this
+                                    //gettimeofday(&start, NULL);
+                                    launch_update_kernel(dimension_count, window_sizes[0]);
+                                    break;
+                                    launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
+				    //launch_ctr++;
+                                    //cudaDeviceSynchronize();
+                                    //std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
                                     cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                                    //gettimeofday(&end, NULL);
                                     cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-				    //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << std::endl;
+                                    have_run_for = h_elapsed;
+                                    if(h_yield_point < grid[0]*grid[1]-1)
+                                    {
+                                       std::cout << h_yield_point << " " << grid[0]*grid[1]-1 << " " << h_elapsed << std::endl;
+                                    }
+				    //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << " " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
                                 }
+                                h_yield_point = 0;
+                                //}
+                                //else
+                                //{
+                                   //unsigned int allotted_slice=200000000;
+                                   //EvqueueLaunch(kid, have_run_for);
+				   //launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
+                                   //cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                                   //cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+                                   //have_run_for = h_elapsed;
+                                //}
 			}
 
 		protected:
