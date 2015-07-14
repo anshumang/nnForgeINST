@@ -51,6 +51,7 @@ int h_elapsed;
 unsigned int *d_yield_point_ret;
 int *d_elapsed_ret;
 int counts_three, allocate;
+int backprop_kernel_ctr, update_kernel_ctr, update_weights_kernel_ctr;
 
 unsigned int h_clock_initialized[15];
 
@@ -58,6 +59,99 @@ namespace nnforge
 {
 	namespace cuda
 	{
+
+    static __device__ __forceinline__ uint32_t __smid()
+    {
+	    uint32_t smid;
+	    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+	    return smid;
+    }
+ 
+    static __device__ __forceinline__ uint32_t yield(unsigned int *d_ret1, int *d_ret2, unsigned int allotted_slice)
+    {
+	    __shared__ bool yield;
+	    int elapsed = 0;
+	    unsigned long long int start_clock = clock64();
+	    int mysmid = __smid();
+	    if(threadIdx.x == 0)
+	    {
+		    if(blockIdx.x + blockIdx.y * gridDim.x < 60)
+		    {
+
+			    if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
+			    {
+				    atomicExch(&d_zero_clock[mysmid], start_clock);
+				    yield = false;
+			    }
+			    else
+			    {
+				    elapsed = start_clock - d_zero_clock[mysmid];
+				    if(elapsed < 1000) /*Less than 1 us should include all blocks in a dispatch set*/
+				    {
+					    yield = false;
+					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					    atomicMax(&d_elapsed, elapsed);
+				    }
+				    else
+				    {
+					    yield = true;
+				    }
+			    }
+		    }
+		    else
+		    {
+			    if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
+			    {
+				    yield = true;
+			    }
+			    else
+			    {
+				    elapsed = start_clock - d_zero_clock[mysmid];
+				    if(elapsed >= allotted_slice/*20000000*/)
+				    {
+					    yield = true;
+				    }
+				    else
+				    {
+					    yield = false;
+					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+					    atomicMax(&d_elapsed, elapsed);
+				    }
+
+			    }
+
+			    if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
+			    {
+				    unsigned int val = atomicExch(&d_yield_point, 0);
+
+				    if(val == gridDim.x * gridDim.y - 1)
+					    atomicExch(&d_yield_point_persist, 0);
+				    else
+					    atomicExch(&d_yield_point_persist, val);
+
+				    *d_ret1 = val; 
+				    val = atomicExch(&d_elapsed, 0);
+				    *d_ret2 = val; 
+				    for(int i=0; i<15; i++)
+				    {
+					    atomicExch(&d_clock_initialized[i],0);
+					    unsigned int val = atomicExch(&d_clock_initialized[i],0);
+				    }
+			    }
+
+		    }
+	    }
+	    __syncthreads();
+	    if(yield==true)
+	    {
+		    return true;                           
+	    }
+            else
+            {
+                    return false;
+            }
+   }
+
 		template<int DIMENSION_COUNT, int WINDOW_WIDTH, int BLOCK_SIZE, bool single_input_feature_map_group>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_tex_exact_blocked_upd_kernel_kepler(
@@ -210,6 +304,164 @@ namespace nnforge
 			}
 		}
 
+		template<int DIMENSION_COUNT, int WINDOW_WIDTH, int BLOCK_SIZE, bool single_input_feature_map_group>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_tex_exact_blocked_upd_kernel_kepler_instrumented(
+			float * __restrict output,
+			cudaTextureObject_t input_tex,
+			cudaTextureObject_t weights_tex,
+			const float * __restrict biases,
+			const packed_config<DIMENSION_COUNT+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count_striped,
+			int output_feature_map_count,
+			int entry_count,
+			int packed_config_count,
+			int input_feature_map_group_size,/*)*/
+                        unsigned long allotted_slice,
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+                        if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
+
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+
+			bool in_bounds = (entry_id < entry_count) && (packed_config_id < packed_config_count);
+			if (in_bounds)
+			{
+				int xyzw_output[DIMENSION_COUNT];
+				int xyzw[DIMENSION_COUNT];
+				int total_weight_count = window_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					total_weight_count *= window_sizes[i];
+				int weight_count_per_output_feature_map = input_feature_map_count_striped * total_weight_count;
+				packed_config<DIMENSION_COUNT+2> conf = packed_config_list[packed_config_id];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+				{
+					xyzw_output[i] = conf.get_val(i);
+					xyzw[i] = xyzw_output[i] - left_zero_padding[i];
+				}
+				int output_feature_map_id = conf.get_val(DIMENSION_COUNT);
+				int base_input_feature_map_id = conf.get_val(DIMENSION_COUNT + 1);
+				int input_elem_id = entry_id * input_feature_map_count_striped + base_input_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_elem_id = input_elem_id * input_sizes[i] + xyzw[i];
+				int weights_offset = (output_feature_map_id * input_feature_map_count_striped + base_input_feature_map_id) * total_weight_count;
+				int iteration_count = min(input_feature_map_group_size, input_feature_map_count_striped - base_input_feature_map_id);
+
+				float initial_values[FEATURE_MAP_BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+					initial_values[i] = 0.0F;
+				if (base_input_feature_map_id == 0)
+				{
+					#pragma unroll
+					for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+						if (i < output_feature_map_count - output_feature_map_id)
+							initial_values[i] = biases[output_feature_map_id + i];
+				}
+				float sums[BLOCK_SIZE * FEATURE_MAP_BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+					#pragma unroll
+					for(int j = 0; j < BLOCK_SIZE; ++j)
+						sums[i * BLOCK_SIZE + j] = initial_values[i];
+
+				for(int input_layer_id = 0; input_layer_id < iteration_count; ++input_layer_id)
+				{
+					for(int input_w = (DIMENSION_COUNT > 3 ? xyzw[3] : 0); input_w < (DIMENSION_COUNT > 3 ? xyzw[3] + window_sizes[3] : 1); ++input_w)
+					{
+						bool b_fit3 = (DIMENSION_COUNT > 3) ? ((unsigned int)input_w < (unsigned int)input_sizes[3]) : true;
+						for(int input_z = (DIMENSION_COUNT > 2 ? xyzw[2] : 0); input_z < (DIMENSION_COUNT > 2 ? xyzw[2] + window_sizes[2] : 1); ++input_z)
+						{
+							bool b_fit2 = (DIMENSION_COUNT > 2) ? (b_fit3 && ((unsigned int)input_z < (unsigned int)input_sizes[2])) : true;
+							for(int input_y = (DIMENSION_COUNT > 1 ? xyzw[1] : 0); input_y < (DIMENSION_COUNT > 1 ? xyzw[1] + window_sizes[1] : 1); ++input_y)
+							{
+								bool b_fit1 = (DIMENSION_COUNT > 1) ? (b_fit2 && ((unsigned int)input_y < (unsigned int)input_sizes[1])) : true;
+
+								float2 input_vals[BLOCK_SIZE + WINDOW_WIDTH - 1];
+								int input_x = xyzw[0];
+								#pragma unroll
+								for(int i = 0; i < BLOCK_SIZE + WINDOW_WIDTH - 1; ++i, ++input_x)
+								{
+									bool b_fit0 = b_fit1 && ((unsigned int)input_x < (unsigned int)input_sizes[0]);
+									input_vals[i] = tex1Dfetch<float2>(input_tex, b_fit0 ? (input_elem_id + i) : -1);
+								}
+
+								#pragma unroll
+								for(int input_x = 0; input_x < WINDOW_WIDTH; ++input_x)
+								{
+									float2 weight_list[FEATURE_MAP_BLOCK_SIZE];
+									#pragma unroll
+									for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+										weight_list[i] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_output_feature_map * i);
+									#pragma unroll
+									for(int j = 0; j < BLOCK_SIZE; ++j)
+									{
+										float2 inp = input_vals[input_x + j]; 
+										#pragma unroll
+										for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+										{
+											sums[i * BLOCK_SIZE + j] += inp.x * weight_list[i].x;
+											sums[i * BLOCK_SIZE + j] += inp.y * weight_list[i].y;
+										}
+									}
+									weights_offset++;
+								} // input_x
+								input_elem_id += input_sizes[0];
+							} // for input_y
+							if (DIMENSION_COUNT > 1)
+								input_elem_id += input_sizes[0] * (input_sizes[1] - window_sizes[1]);
+						} // for input_z
+						if (DIMENSION_COUNT > 2)
+							input_elem_id += input_sizes[1] * input_sizes[0] * (input_sizes[2] - window_sizes[2]);
+					} // for input_w
+					if (DIMENSION_COUNT > 3)
+						input_elem_id += input_sizes[2] * input_sizes[1] * input_sizes[0] * (input_sizes[3] - window_sizes[3]);
+				}
+
+				int output_offset = entry_id * output_feature_map_count + output_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_offset = output_offset * output_sizes[i] + xyzw_output[i];
+				float * base_output = output + output_offset;
+				int output_neuron_count_per_feature_map = output_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					output_neuron_count_per_feature_map *= output_sizes[i];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+				{
+					if (i < output_feature_map_count - output_feature_map_id)
+					{
+						#pragma unroll
+						for(int j = 0; j < BLOCK_SIZE; ++j)
+						{
+							if (j < output_sizes[0] - xyzw_output[0])
+							{
+								if (single_input_feature_map_group)
+								{
+									base_output[j + output_neuron_count_per_feature_map * i] = sums[i * BLOCK_SIZE + j];
+								}
+								else
+								{
+									atomicAdd(base_output + output_neuron_count_per_feature_map * i + j, sums[i * BLOCK_SIZE + j]);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		template<int DIMENSION_COUNT, int BLOCK_SIZE, bool single_input_feature_map_group>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_tex_generic_blocked_upd_kernel_kepler(
@@ -228,6 +480,158 @@ namespace nnforge
 			int packed_config_count,
 			int input_feature_map_group_size)
 		{
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+
+			bool in_bounds = (entry_id < entry_count) && (packed_config_id < packed_config_count);
+			if (in_bounds)
+			{
+				int xyzw_output[DIMENSION_COUNT];
+				int xyzw[DIMENSION_COUNT];
+				int total_weight_count = window_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					total_weight_count *= window_sizes[i];
+				int weight_count_per_output_feature_map = input_feature_map_count_striped * total_weight_count;
+				packed_config<DIMENSION_COUNT+2> conf = packed_config_list[packed_config_id];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+				{
+					xyzw_output[i] = conf.get_val(i);
+					xyzw[i] = xyzw_output[i] - left_zero_padding[i];
+				}
+				int output_feature_map_id = conf.get_val(DIMENSION_COUNT);
+				int base_input_feature_map_id = conf.get_val(DIMENSION_COUNT + 1);
+				int input_elem_id = entry_id * input_feature_map_count_striped + base_input_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_elem_id = input_elem_id * input_sizes[i] + xyzw[i];
+				int weights_offset = (output_feature_map_id * input_feature_map_count_striped + base_input_feature_map_id) * total_weight_count;
+				int iteration_count = min(input_feature_map_group_size, input_feature_map_count_striped - base_input_feature_map_id);
+
+				float initial_values[FEATURE_MAP_BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+					initial_values[i] = 0.0F;
+				if (base_input_feature_map_id == 0)
+				{
+					#pragma unroll
+					for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+						if (i < output_feature_map_count - output_feature_map_id)
+							initial_values[i] = biases[output_feature_map_id + i];
+				}
+				float sums[BLOCK_SIZE * FEATURE_MAP_BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+					#pragma unroll
+					for(int j = 0; j < BLOCK_SIZE; ++j)
+						sums[i * BLOCK_SIZE + j] = initial_values[i];
+
+				for(int input_layer_id = 0; input_layer_id < iteration_count; ++input_layer_id)
+				{
+					for(int input_w = (DIMENSION_COUNT > 3 ? xyzw[3] : 0); input_w < (DIMENSION_COUNT > 3 ? xyzw[3] + window_sizes[3] : 1); ++input_w)
+					{
+						bool b_fit3 = (DIMENSION_COUNT > 3) ? ((unsigned int)input_w < (unsigned int)input_sizes[3]) : true;
+						for(int input_z = (DIMENSION_COUNT > 2 ? xyzw[2] : 0); input_z < (DIMENSION_COUNT > 2 ? xyzw[2] + window_sizes[2] : 1); ++input_z)
+						{
+							bool b_fit2 = (DIMENSION_COUNT > 2) ? (b_fit3 && ((unsigned int)input_z < (unsigned int)input_sizes[2])) : true;
+							for(int input_y = (DIMENSION_COUNT > 1 ? xyzw[1] : 0); input_y < (DIMENSION_COUNT > 1 ? xyzw[1] + window_sizes[1] : 1); ++input_y)
+							{
+								bool b_fit1 = (DIMENSION_COUNT > 1) ? (b_fit2 && ((unsigned int)input_y < (unsigned int)input_sizes[1])) : true;
+
+								#pragma unroll 4
+								for(int input_x = xyzw[0]; input_x < xyzw[0] + window_sizes[0]; ++input_x)
+								{
+									float2 weight_list[FEATURE_MAP_BLOCK_SIZE];
+									#pragma unroll
+									for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+										weight_list[i] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_output_feature_map * i);
+									#pragma unroll
+									for(int j = 0; j < BLOCK_SIZE; ++j)
+									{
+										int input_x_total = input_x + j;
+										bool b_fit0 = b_fit1 && ((unsigned int)input_x_total < (unsigned int)input_sizes[0]);
+										float2 inp = tex1Dfetch<float2>(input_tex, b_fit0 ? (input_elem_id - xyzw[0] + input_x_total) : -1); 
+
+										#pragma unroll
+										for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+										{
+											sums[i * BLOCK_SIZE + j] += inp.x * weight_list[i].x;
+											sums[i * BLOCK_SIZE + j] += inp.y * weight_list[i].y;
+										}
+									}
+									weights_offset++;
+								} // for input_x
+								input_elem_id += input_sizes[0];
+							} // for input_y
+							if (DIMENSION_COUNT > 1)
+								input_elem_id += input_sizes[0] * (input_sizes[1] - window_sizes[1]);
+						} // for input_z
+						if (DIMENSION_COUNT > 2)
+							input_elem_id += input_sizes[1] * input_sizes[0] * (input_sizes[2] - window_sizes[2]);
+					} // for input_w
+					if (DIMENSION_COUNT > 3)
+						input_elem_id += input_sizes[2] * input_sizes[1] * input_sizes[0] * (input_sizes[3] - window_sizes[3]);
+				}
+
+				int output_offset = entry_id * output_feature_map_count + output_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_offset = output_offset * output_sizes[i] + xyzw_output[i];
+				float * base_output = output + output_offset;
+				int output_neuron_count_per_feature_map = output_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					output_neuron_count_per_feature_map *= output_sizes[i];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+				{
+					if (i < output_feature_map_count - output_feature_map_id)
+					{
+						#pragma unroll
+						for(int j = 0; j < BLOCK_SIZE; ++j)
+						{
+							if (j < output_sizes[0] - xyzw_output[0])
+							{
+								if (single_input_feature_map_group)
+								{
+									base_output[j + output_neuron_count_per_feature_map * i] = sums[i * BLOCK_SIZE + j];
+								}
+								else
+								{
+									atomicAdd(base_output + output_neuron_count_per_feature_map * i + j, sums[i * BLOCK_SIZE + j]);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		template<int DIMENSION_COUNT, int BLOCK_SIZE, bool single_input_feature_map_group>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_tex_generic_blocked_upd_kernel_kepler_instrumented(
+			float * __restrict output,
+			cudaTextureObject_t input_tex,
+			cudaTextureObject_t weights_tex,
+			const float * __restrict biases,
+			const packed_config<DIMENSION_COUNT+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count_striped,
+			int output_feature_map_count,
+			int entry_count,
+			int packed_config_count,
+			int input_feature_map_group_size,/*)*/
+                        unsigned long allotted_slice,
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+                        if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
+
 			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
 			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -511,6 +915,167 @@ namespace nnforge
 			}
 		}
 
+		template<int DIMENSION_COUNT, int WINDOW_WIDTH, int BLOCK_SIZE, bool single_output_feature_map_group>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_backprop_tex_exact_blocked_upd_kernel_kepler_instrumented(
+			float * __restrict input_errors,
+			cudaTextureObject_t output_tex,
+			cudaTextureObject_t weights_tex,
+			const packed_config<DIMENSION_COUNT+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count,
+			int input_feature_map_count_striped,
+			int output_feature_map_count,
+			int output_feature_map_count_striped,
+			int entry_count,
+			int packed_config_count,
+			int output_feature_map_group_size,/*)*/
+                        unsigned long allotted_slice,
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+                        if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
+
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+
+			bool in_bounds = (entry_id < entry_count) && (packed_config_id < packed_config_count);
+			if (in_bounds)
+			{
+				int xyzw_input[DIMENSION_COUNT];
+				int xyzw[DIMENSION_COUNT];
+				int total_weight_count = window_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					total_weight_count *= window_sizes[i];
+				int weight_count_per_striped_input_feature_map = total_weight_count;
+				int weight_count_per_output_feature_map = input_feature_map_count_striped * total_weight_count;
+				packed_config<DIMENSION_COUNT+2> conf = packed_config_list[packed_config_id];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+				{
+					xyzw_input[i] = conf.get_val(i);
+					xyzw[i] = xyzw_input[i] + left_zero_padding[i];
+				}
+				int input_feature_map_id_striped = conf.get_val(DIMENSION_COUNT);
+				int base_output_feature_map_id_striped = conf.get_val(DIMENSION_COUNT + 1);
+				int output_elem_id = entry_id * output_feature_map_count_striped + base_output_feature_map_id_striped;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_elem_id = output_elem_id * output_sizes[i] + xyzw[i];
+				int weights_offset = ((base_output_feature_map_id_striped << 1) * input_feature_map_count_striped + input_feature_map_id_striped) * total_weight_count;
+				int iteration_count = min(output_feature_map_group_size, output_feature_map_count_striped - base_output_feature_map_id_striped);
+
+				float sums[FEATURE_MAP_BLOCK_SIZE * BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE * BLOCK_SIZE; ++i)
+					sums[i] = 0.0F;
+
+				for(int output_layer_id = 0; output_layer_id < iteration_count; ++output_layer_id)
+				{
+					for(int input_w = (DIMENSION_COUNT > 3 ? xyzw[3] : 1); input_w > (DIMENSION_COUNT > 3 ? xyzw[3] - window_sizes[3] : 0); --input_w)
+					{
+						bool b_fit3 = (DIMENSION_COUNT > 3) ? ((unsigned int)input_w < (unsigned int)output_sizes[3]) : true;
+						for(int input_z = (DIMENSION_COUNT > 2 ? xyzw[2] : 1); input_z > (DIMENSION_COUNT > 2 ? xyzw[2] - window_sizes[2] : 0); --input_z)
+						{
+							bool b_fit2 = (DIMENSION_COUNT > 2) ? (b_fit3 && ((unsigned int)input_z < (unsigned int)output_sizes[2])) : true;
+							for(int input_y = (DIMENSION_COUNT > 1 ? xyzw[1] : 1); input_y > (DIMENSION_COUNT > 1 ? xyzw[1] - window_sizes[1] : 0); --input_y)
+							{
+								bool b_fit1 = (DIMENSION_COUNT > 1) ? (b_fit2 && ((unsigned int)input_y < (unsigned int)output_sizes[1])) : true;
+
+								float2 output_vals[BLOCK_SIZE + WINDOW_WIDTH - 1];
+								int input_x = xyzw[0];
+								#pragma unroll
+								for(int i = 0; i < BLOCK_SIZE + WINDOW_WIDTH - 1; ++i, --input_x)
+								{
+									bool b_fit0 = b_fit1 && ((unsigned int)input_x < (unsigned int)output_sizes[0]);
+									output_vals[i] = tex1Dfetch<float2>(output_tex, b_fit0 ? (output_elem_id - i) : -1);
+								}
+
+								#pragma unroll
+								for(int input_x = 0; input_x < WINDOW_WIDTH; ++input_x)
+								{
+									float2 weight_list[FEATURE_MAP_BLOCK_SIZE];
+									#pragma unroll
+									for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE/2; ++i)
+									{
+										weight_list[i] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_striped_input_feature_map * i);
+										weight_list[i + (FEATURE_MAP_BLOCK_SIZE/2)] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_output_feature_map + weight_count_per_striped_input_feature_map * i);
+									}
+
+									#pragma unroll
+									for(int j = 0; j < BLOCK_SIZE; ++j)
+									{
+										#pragma unroll
+										for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE/2; ++i)
+										{
+											sums[(i * 2) * BLOCK_SIZE + j] += output_vals[input_x + j].x * weight_list[i].x;
+											sums[(i * 2) * BLOCK_SIZE + j] += output_vals[input_x + j].y * weight_list[(FEATURE_MAP_BLOCK_SIZE/2) + i].x;
+											sums[(i * 2 + 1) * BLOCK_SIZE + j] += output_vals[input_x + j].x * weight_list[i].y;
+											sums[(i * 2 + 1) * BLOCK_SIZE + j] += output_vals[input_x + j].y * weight_list[(FEATURE_MAP_BLOCK_SIZE/2) + i].y;
+										}
+									}
+									weights_offset++;
+								}
+								if (DIMENSION_COUNT == 1)
+									output_elem_id += output_sizes[0];
+								else
+									output_elem_id -= output_sizes[0];
+							} // for(int input_y
+							if (DIMENSION_COUNT == 2)
+								output_elem_id += output_sizes[0] * (window_sizes[1] + output_sizes[1]);
+							else if (DIMENSION_COUNT > 2)
+								output_elem_id += output_sizes[0] * (window_sizes[1] - output_sizes[1]);
+						} // for(int input_z
+						if (DIMENSION_COUNT == 3)
+							output_elem_id += output_sizes[1] * output_sizes[0] * (window_sizes[2] + output_sizes[2]);
+						else if (DIMENSION_COUNT > 3)
+							output_elem_id += output_sizes[1] * output_sizes[0] * (window_sizes[2] - output_sizes[2]);
+					} // for(int input_w
+					if (DIMENSION_COUNT == 4)
+						output_elem_id += output_sizes[2] * output_sizes[1] * output_sizes[0] * (window_sizes[3] + output_sizes[3]);
+					weights_offset += (weight_count_per_output_feature_map << 1) - weight_count_per_striped_input_feature_map;
+				} // for(int output_layer_id
+
+				int input_feature_map_id = input_feature_map_id_striped << 1;
+				int input_offset = entry_id * input_feature_map_count + input_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_offset = input_offset * input_sizes[i] + xyzw_input[i];
+				float * base_input = input_errors + input_offset;
+				int input_neuron_count_per_feature_map = input_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					input_neuron_count_per_feature_map *= input_sizes[i];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+				{
+					if (i < input_feature_map_count - input_feature_map_id)
+					{
+						#pragma unroll
+						for(int j = 0; j < BLOCK_SIZE; ++j)
+						{
+							if (j > xyzw_input[0] - input_sizes[0])
+							{
+								if (single_output_feature_map_group)
+								{
+									*(base_input + input_neuron_count_per_feature_map * i - j) = sums[i * BLOCK_SIZE + j];
+								}
+								else
+								{
+									atomicAdd(base_input + input_neuron_count_per_feature_map * i - j, sums[i * BLOCK_SIZE + j]);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		template<int DIMENSION_COUNT, int BLOCK_SIZE, bool single_output_feature_map_group>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_backprop_tex_generic_blocked_upd_kernel_kepler(
@@ -530,6 +1095,162 @@ namespace nnforge
 			int packed_config_count,
 			int output_feature_map_group_size)
 		{
+			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
+			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
+
+			bool in_bounds = (entry_id < entry_count) && (packed_config_id < packed_config_count);
+			if (in_bounds)
+			{
+				int xyzw_input[DIMENSION_COUNT];
+				int xyzw[DIMENSION_COUNT];
+				int total_weight_count = window_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					total_weight_count *= window_sizes[i];
+				int weight_count_per_striped_input_feature_map = total_weight_count;
+				int weight_count_per_output_feature_map = input_feature_map_count_striped * total_weight_count;
+				packed_config<DIMENSION_COUNT+2> conf = packed_config_list[packed_config_id];
+				#pragma unroll
+				for(int i = 0; i < DIMENSION_COUNT; ++i)
+				{
+					xyzw_input[i] = conf.get_val(i);
+					xyzw[i] = xyzw_input[i] + left_zero_padding[i];
+				}
+				int input_feature_map_id_striped = conf.get_val(DIMENSION_COUNT);
+				int base_output_feature_map_id_striped = conf.get_val(DIMENSION_COUNT + 1);
+				int output_elem_id = entry_id * output_feature_map_count_striped + base_output_feature_map_id_striped;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					output_elem_id = output_elem_id * output_sizes[i] + xyzw[i];
+				int weights_offset = ((base_output_feature_map_id_striped << 1) * input_feature_map_count_striped + input_feature_map_id_striped) * total_weight_count;
+				int iteration_count = min(output_feature_map_group_size, output_feature_map_count_striped - base_output_feature_map_id_striped);
+
+				float sums[FEATURE_MAP_BLOCK_SIZE * BLOCK_SIZE];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE * BLOCK_SIZE; ++i)
+					sums[i] = 0.0F;
+
+				for(int output_layer_id = 0; output_layer_id < iteration_count; ++output_layer_id)
+				{
+					for(int input_w = (DIMENSION_COUNT > 3 ? xyzw[3] : 1); input_w > (DIMENSION_COUNT > 3 ? xyzw[3] - window_sizes[3] : 0); --input_w)
+					{
+						bool b_fit3 = (DIMENSION_COUNT > 3) ? ((unsigned int)input_w < (unsigned int)output_sizes[3]) : true;
+						for(int input_z = (DIMENSION_COUNT > 2 ? xyzw[2] : 1); input_z > (DIMENSION_COUNT > 2 ? xyzw[2] - window_sizes[2] : 0); --input_z)
+						{
+							bool b_fit2 = (DIMENSION_COUNT > 2) ? (b_fit3 && ((unsigned int)input_z < (unsigned int)output_sizes[2])) : true;
+							for(int input_y = (DIMENSION_COUNT > 1 ? xyzw[1] : 1); input_y > (DIMENSION_COUNT > 1 ? xyzw[1] - window_sizes[1] : 0); --input_y)
+							{
+								bool b_fit1 = (DIMENSION_COUNT > 1) ? (b_fit2 && ((unsigned int)input_y < (unsigned int)output_sizes[1])) : true;
+
+								#pragma unroll 4
+								for(int input_x = xyzw[0]; input_x > xyzw[0] - window_sizes[0]; --input_x)
+								{
+									float2 weight_list[FEATURE_MAP_BLOCK_SIZE];
+									#pragma unroll
+									for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE/2; ++i)
+									{
+										weight_list[i] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_striped_input_feature_map * i);
+										weight_list[i + (FEATURE_MAP_BLOCK_SIZE/2)] = tex1Dfetch<float2>(weights_tex, weights_offset + weight_count_per_output_feature_map + weight_count_per_striped_input_feature_map * i);
+									}
+
+									#pragma unroll
+									for(int j = 0; j < BLOCK_SIZE; ++j)
+									{
+										int output_x_total = input_x - j;
+										bool b_fit0 = b_fit1 && ((unsigned int)output_x_total < (unsigned int)output_sizes[0]);
+										float2 output_val = tex1Dfetch<float2>(output_tex, b_fit0 ? (output_elem_id - xyzw[0] + output_x_total) : -1);
+										#pragma unroll
+										for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE/2; ++i)
+										{
+											sums[(i * 2) * BLOCK_SIZE + j] += output_val.x * weight_list[i].x;
+											sums[(i * 2) * BLOCK_SIZE + j] += output_val.y * weight_list[(FEATURE_MAP_BLOCK_SIZE/2) + i].x;
+											sums[(i * 2 + 1) * BLOCK_SIZE + j] += output_val.x * weight_list[i].y;
+											sums[(i * 2 + 1) * BLOCK_SIZE + j] += output_val.y * weight_list[(FEATURE_MAP_BLOCK_SIZE/2) + i].y;
+										}
+									}
+
+									weights_offset++;
+								}
+								if (DIMENSION_COUNT == 1)
+									output_elem_id += output_sizes[0];
+								else
+									output_elem_id -= output_sizes[0];
+							} // for(int input_y
+							if (DIMENSION_COUNT == 2)
+								output_elem_id += output_sizes[0] * (window_sizes[1] + output_sizes[1]);
+							else if (DIMENSION_COUNT > 2)
+								output_elem_id += output_sizes[0] * (window_sizes[1] - output_sizes[1]);
+						} // for(int input_z
+						if (DIMENSION_COUNT == 3)
+							output_elem_id += output_sizes[1] * output_sizes[0] * (window_sizes[2] + output_sizes[2]);
+						else if (DIMENSION_COUNT > 3)
+							output_elem_id += output_sizes[1] * output_sizes[0] * (window_sizes[2] - output_sizes[2]);
+					} // for(int input_w
+					if (DIMENSION_COUNT == 4)
+						output_elem_id += output_sizes[2] * output_sizes[1] * output_sizes[0] * (window_sizes[3] + output_sizes[3]);
+					weights_offset += (weight_count_per_output_feature_map << 1) - weight_count_per_striped_input_feature_map;
+				} // for(int output_layer_id
+
+				int input_feature_map_id = input_feature_map_id_striped << 1;
+				int input_offset = entry_id * input_feature_map_count + input_feature_map_id;
+				#pragma unroll
+				for(int i = DIMENSION_COUNT - 1; i >= 0; --i)
+					input_offset = input_offset * input_sizes[i] + xyzw_input[i];
+				float * base_input = input_errors + input_offset;
+				int input_neuron_count_per_feature_map = input_sizes[0];
+				#pragma unroll
+				for(int i = 1; i < DIMENSION_COUNT; ++i)
+					input_neuron_count_per_feature_map *= input_sizes[i];
+				#pragma unroll
+				for(int i = 0; i < FEATURE_MAP_BLOCK_SIZE; ++i)
+				{
+					if (i < input_feature_map_count - input_feature_map_id)
+					{
+						#pragma unroll
+						for(int j = 0; j < BLOCK_SIZE; ++j)
+						{
+							if (j > xyzw_input[0] - input_sizes[0])
+							{
+								if (single_output_feature_map_group)
+								{
+									*(base_input + input_neuron_count_per_feature_map * i - j) = sums[i * BLOCK_SIZE + j];
+								}
+								else
+								{
+									atomicAdd(base_input + input_neuron_count_per_feature_map * i - j, sums[i * BLOCK_SIZE + j]);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		template<int DIMENSION_COUNT, int BLOCK_SIZE, bool single_output_feature_map_group>
+		__launch_bounds__(256, 4)
+		__global__ void convolution_backprop_tex_generic_blocked_upd_kernel_kepler_instrumented(
+			float * __restrict input_errors,
+			cudaTextureObject_t output_tex,
+			cudaTextureObject_t weights_tex,
+			const packed_config<DIMENSION_COUNT+2> * __restrict packed_config_list,
+			array_by_val<int, DIMENSION_COUNT> output_sizes,
+			array_by_val<int, DIMENSION_COUNT> input_sizes,
+			array_by_val<int, DIMENSION_COUNT> window_sizes,
+			array_by_val<int, DIMENSION_COUNT> left_zero_padding,
+			int input_feature_map_count,
+			int input_feature_map_count_striped,
+			int output_feature_map_count,
+			int output_feature_map_count_striped,
+			int entry_count,
+			int packed_config_count,
+			int output_feature_map_group_size, /*)*/
+                        unsigned long allotted_slice,
+                        unsigned int *d_ret1,
+                        int *d_ret2)
+		{
+                        if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
+
 			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
 			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -856,97 +1577,6 @@ namespace nnforge
 			}
 		}
 
-    static __device__ __forceinline__ uint32_t __smid()
-    {
-	    uint32_t smid;
-	    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-	    return smid;
-    }
- 
-    static __device__ __forceinline__ uint32_t yield(unsigned int *d_ret1, int *d_ret2, unsigned int allotted_slice)
-    {
-	    __shared__ bool yield;
-	    int elapsed = 0;
-	    unsigned long long int start_clock = clock64();
-	    int mysmid = __smid();
-	    if(threadIdx.x == 0)
-	    {
-		    if(blockIdx.x + blockIdx.y * gridDim.x < 60)
-		    {
-
-			    if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
-			    {
-				    atomicExch(&d_zero_clock[mysmid], start_clock);
-				    yield = false;
-			    }
-			    else
-			    {
-				    elapsed = start_clock - d_zero_clock[mysmid];
-				    if(elapsed < 1000) /*Less than 1 us should include all blocks in a dispatch set*/
-				    {
-					    yield = false;
-					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
-					    atomicMax(&d_elapsed, elapsed);
-				    }
-				    else
-				    {
-					    yield = true;
-				    }
-			    }
-		    }
-		    else
-		    {
-			    if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
-			    {
-				    yield = true;
-			    }
-			    else
-			    {
-				    elapsed = start_clock - d_zero_clock[mysmid];
-				    if(elapsed >= allotted_slice/*20000000*/)
-				    {
-					    yield = true;
-				    }
-				    else
-				    {
-					    yield = false;
-					    atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
-					    atomicMax(&d_elapsed, elapsed);
-				    }
-
-			    }
-
-			    if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
-			    {
-				    unsigned int val = atomicExch(&d_yield_point, 0);
-
-				    if(val == gridDim.x * gridDim.y - 1)
-					    atomicExch(&d_yield_point_persist, 0);
-				    else
-					    atomicExch(&d_yield_point_persist, val);
-
-				    *d_ret1 = val; 
-				    val = atomicExch(&d_elapsed, 0);
-				    *d_ret2 = val; 
-				    for(int i=0; i<15; i++)
-				    {
-					    atomicExch(&d_clock_initialized[i],0);
-					    unsigned int val = atomicExch(&d_clock_initialized[i],0);
-				    }
-			    }
-
-		    }
-	    }
-	    __syncthreads();
-	    if(yield==true)
-	    {
-		    return true;                           
-	    }
-            else
-            {
-                    return false;
-            }
-   }
 		template<int DIMENSION_COUNT, int WINDOW_WIDTH>
 		__launch_bounds__(256, 4)
 		__global__ void convolution_update_weights_exact_upd_kernel_kepler_instrumented(
@@ -971,6 +1601,9 @@ namespace nnforge
                         unsigned int *d_ret1,
                         int *d_ret2)
 		{
+                        if(yield(d_ret1, d_ret2, allotted_slice))
+                          return;
+
 			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
 			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
                      #if 0
@@ -1063,8 +1696,6 @@ namespace nnforge
 				return;                           
                         }
                       #endif
-                      if(yield(d_ret1, d_ret2, allotted_slice))
-                          return;
 
 			bool in_bounds = (packed_config_id < packed_config_count) && (entry_id < entry_count);
 			if (in_bounds)
@@ -1230,6 +1861,7 @@ namespace nnforge
 			int packed_config_count,
 			int last_dimension_group_count)
 		{
+
 			int packed_config_id = blockIdx.x * blockDim.x + threadIdx.x;
 			int entry_id = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -1386,7 +2018,7 @@ namespace nnforge
                         unsigned int *d_ret1,
                         int *d_ret2)
 		{
-                     #if 1
+                     #if 0
                         __shared__ bool yield;
                         int elapsed = 0;
                         unsigned long long int start_clock = clock64();
@@ -1591,7 +2223,6 @@ namespace nnforge
 		}
 #define launch_exact_kernel_const_const_const_const(dimension_count_const, window_width_const, block_size_const, single_input_feature_map_group_count_const) \
 	convolution_tex_exact_blocked_upd_kernel_kepler<dimension_count_const,window_width_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
-	//convolution_tex_exact_blocked_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
 
 #define launch_generic_kernel_const_const_const(dimension_count_const, block_size_const, single_input_feature_map_group_count_const) \
 	convolution_tex_generic_blocked_upd_kernel_kepler<dimension_count_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size);
@@ -1665,11 +2296,92 @@ namespace nnforge
 			break; \
 		};
 
+#define launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, window_width_const, block_size_const, single_input_feature_map_group_count_const, allotted_slice) \
+	convolution_tex_exact_blocked_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size, allotted_slice, d_yield_point_ret, d_elapsed_ret);
+
+#define launch_generic_kernel_const_const_const_instrumented(dimension_count_const, block_size_const, single_input_feature_map_group_count_const, allotted_slice) \
+	convolution_tex_generic_blocked_upd_kernel_kepler_instrumented<dimension_count_const,block_size_const,single_input_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*output_neurons_buffer, input_tex, weights_tex, *data[1], packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, entry_count, forward_packed_config_count, forward_input_feature_map_group_size, allotted_slice, d_yield_point_ret, d_elapsed_ret);
+
+#define launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, block_size_const, single_input_feature_map_group_count_const, allotted_slice) \
+	switch (window_width) \
+		{ \
+		case 1: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 1, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 2: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 2, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 3: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 3, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 4: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 4, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 5: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 5, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 6: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 6, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 7: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 7, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 8: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 8, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 9: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 9, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 10: \
+			launch_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 10, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		default: \
+			launch_generic_kernel_const_const_const_instrumented(dimension_count_const, block_size_const, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		};
+
+#define launch_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, single_input_feature_map_group_count_const, allotted_slice) \
+	switch (block_size) \
+		{ \
+		case 1: \
+			launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 1, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 2: \
+			launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 2, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 3: \
+			launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 3, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 4: \
+			launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 4, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 5: \
+			launch_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 5, single_input_feature_map_group_count_const, allotted_slice); \
+			break; \
+		};
+
+#define launch_kernel_instrumented(dimension_count_const, window_width, block_size, single_input_feature_map_group_count, allotted_slice) \
+	switch (single_input_feature_map_group_count) \
+		{ \
+		case false: \
+			launch_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, false, allotted_slice); \
+			break; \
+		case true: \
+			launch_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, true, allotted_slice); \
+			break; \
+		};
+
 #define launch_backprop_exact_kernel_const_const_const_const(dimension_count_const, window_width_const, block_size_const, single_output_feature_map_group_count_const) \
 	convolution_backprop_tex_exact_blocked_upd_kernel_kepler<dimension_count_const,window_width_const,block_size_const,single_output_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*input_errors_buffer, output_tex, weights_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, output_configuration_specific_striped.feature_map_count, entry_count, backward_packed_config_count, backward_output_feature_map_group_size);
 
+#define launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, window_width_const, block_size_const, single_output_feature_map_group_count_const, allotted_slice) \
+	convolution_backprop_tex_exact_blocked_upd_kernel_kepler_instrumented<dimension_count_const,window_width_const,block_size_const,single_output_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*input_errors_buffer, output_tex, weights_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, output_configuration_specific_striped.feature_map_count, entry_count, backward_packed_config_count, backward_output_feature_map_group_size, allotted_slice, d_yield_point_ret, d_elapsed_ret);
+
 #define launch_backprop_generic_kernel_const_const_const(dimension_count_const, block_size_const, single_output_feature_map_group_count_const) \
 	convolution_backprop_tex_generic_blocked_upd_kernel_kepler<dimension_count_const,block_size_const,single_output_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*input_errors_buffer, output_tex, weights_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, output_configuration_specific_striped.feature_map_count, entry_count, backward_packed_config_count, backward_output_feature_map_group_size);
+
+#define launch_backprop_generic_kernel_const_const_const_instrumented(dimension_count_const, block_size_const, single_output_feature_map_group_count_const, allotted_slice) \
+	convolution_backprop_tex_generic_blocked_upd_kernel_kepler_instrumented<dimension_count_const,block_size_const,single_output_feature_map_group_count_const><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*input_errors_buffer, output_tex, weights_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific.feature_map_count, output_configuration_specific_striped.feature_map_count, entry_count, backward_packed_config_count, backward_output_feature_map_group_size, allotted_slice, d_yield_point_ret, d_elapsed_ret);
 
 #define launch_backprop_kernel_const_const_cost(dimension_count_const, window_width, block_size_const, single_output_feature_map_group_count_const) \
 	switch (window_width) \
@@ -1709,6 +2421,44 @@ namespace nnforge
 			break; \
 		};
 
+#define launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, block_size_const, single_output_feature_map_group_count_const, allotted_slice) \
+	switch (window_width) \
+		{ \
+		case 1: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 1, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 2: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 2, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 3: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 3, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 4: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 4, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 5: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 5, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 6: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 6, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 7: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 7, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 8: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 8, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 9: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 9, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 10: \
+			launch_backprop_exact_kernel_const_const_const_const_instrumented(dimension_count_const, 10, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		default: \
+			launch_backprop_generic_kernel_const_const_const_instrumented(dimension_count_const, block_size_const, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		};
+
 #define launch_backprop_kernel_const_const(dimension_count_const, window_width, block_size, single_output_feature_map_group_count_const) \
 	switch (block_size) \
 		{ \
@@ -1729,6 +2479,26 @@ namespace nnforge
 			break; \
 		};
 
+#define launch_backprop_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, single_output_feature_map_group_count_const, allotted_slice) \
+	switch (block_size) \
+		{ \
+		case 1: \
+			launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 1, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 2: \
+			launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 2, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 3: \
+			launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 3, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 4: \
+			launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 4, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		case 5: \
+			launch_backprop_kernel_const_const_cost_instrumented(dimension_count_const, window_width, 5, single_output_feature_map_group_count_const, allotted_slice); \
+			break; \
+		};
+
 #define launch_backprop_kernel(dimension_count_const, window_width, block_size, single_output_feature_map_group_count) \
 	switch (single_output_feature_map_group_count) \
 		{ \
@@ -1737,6 +2507,17 @@ namespace nnforge
 			break; \
 		case true: \
 			launch_backprop_kernel_const_const(dimension_count_const, window_width, block_size, true); \
+			break; \
+		};
+
+#define launch_backprop_kernel_instrumented(dimension_count_const, window_width, block_size, single_output_feature_map_group_count, allotted_slice) \
+	switch (single_output_feature_map_group_count) \
+		{ \
+		case false: \
+			launch_backprop_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, false, allotted_slice); \
+			break; \
+		case true: \
+			launch_backprop_kernel_const_const_instrumented(dimension_count_const, window_width, block_size, true, allotted_slice); \
 			break; \
 		};
 
@@ -1894,8 +2675,67 @@ namespace nnforge
                                 grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_tex_exact_blocked_upd_kernel_kepler", grid, block);
-                                //EvqueueLaunch(kid, 0);
-				launch_kernel(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count);
+                                if(allocate == 0)
+                                {
+                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_elapsed_ret, sizeof(int));
+                                allocate = 1;
+                                }
+
+                                unsigned long have_run_for=0;
+
+                                h_yield_point = 0;
+                                update_kernel_ctr++;
+                                bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
+                                long service_id=-1, service_id_dummy=-1;
+				while(h_yield_point < grid[0]*grid[1]-1)
+				{
+					if(yield_global)
+					{
+						if(h_yield_point == 0)
+						{
+							service_id = EvqueueLaunch(kid, have_run_for, service_id_dummy);
+							std::cout << "New UE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id != -1);
+						}
+						else
+						{
+							service_id_dummy = EvqueueLaunch(kid, have_run_for, service_id);
+							std::cout << "In service UE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id_dummy == -1);
+						}
+						assert(service_id != -1);
+					}
+					if(yield_local && yield_local_select)
+					{
+                                                assert(yield_global == false);
+						std::cout << "UE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_kernel_instrumented(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count, allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+
+					}
+					else if(yield_global && yield_global_select && (service_id != 10000000))
+					{
+                                                assert(yield_local == false);
+						std::cout << "UE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_kernel_instrumented(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count, allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+						//std::cout << "UE " << h_yield_point << "/" << grid[0]*grid[1]-1 << " " << h_elapsed << std::endl;
+					}
+					else
+					{
+						std::cout << "UE default " << grid[0]*grid[1]-1 << std::endl;
+						launch_kernel(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count);
+						break;
+					}
+                                }
+                                h_yield_point = 0;
 			}
 
 			virtual void enqueue_backprop(
@@ -1945,8 +2785,73 @@ namespace nnforge
                                 grid[0]=kernel_dims.first.x; grid[1]=kernel_dims.first.y; grid[2]=kernel_dims.first.z;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_backprop_tex_exact_blocked_upd_kernel_kepler", grid, block);
-                                //EvqueueLaunch(kid, 0);
-				launch_backprop_kernel(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count);
+                                if(allocate == 0)
+                                {
+                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_elapsed_ret, sizeof(int));
+                                allocate = 1;
+                                }
+
+                                unsigned long have_run_for=0;
+
+                                h_yield_point = 0;
+                                backprop_kernel_ctr++;
+                                bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
+				//std::cout << "BPE " << backprop_kernel_ctr << " " << grid[0]*grid[1]-1 << std::endl;
+                                /*if((backprop_kernel_ctr%7==3)||(backprop_kernel_ctr%7==4)||(backprop_kernel_ctr%7==6))
+                                {
+                                      yield_global_select = true;
+                                      yield_local_select = true;
+                                }*/
+				long service_id = -1, service_id_dummy = -1;
+                                while(h_yield_point < grid[0]*grid[1]-1)
+				{
+					if(yield_global)
+					{
+						if(h_yield_point == 0)
+						{
+							service_id = EvqueueLaunch(kid, have_run_for, service_id_dummy);
+							std::cout << "New BPE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id != -1);
+						}
+						else
+						{
+							service_id_dummy = EvqueueLaunch(kid, have_run_for, service_id);
+							std::cout << "In service BPE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id_dummy == -1);
+						}
+						assert(service_id != -1);
+					}
+                                        if(yield_local && yield_local_select)
+                                        {
+                                                assert(yield_global == false);
+						std::cout << "BPE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_backprop_kernel_instrumented(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count, allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+
+                                        }
+					else if(yield_global && yield_global_select && (service_id != 10000000))
+					{
+                                                assert(yield_local == false);
+						std::cout << "BPE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_backprop_kernel_instrumented(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count, allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+						//std::cout << "BPE " << h_yield_point << "/" << grid[0]*grid[1]-1 << " " << h_elapsed << std::endl;
+					}
+					else
+					{
+						std::cout << "BPE default " << grid[0]*grid[1]-1 << std::endl;
+						launch_backprop_kernel(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count);
+						break;
+					}
+				}
+                                h_yield_point = 0;
 			}
 
 			virtual void enqueue_update_weights(
@@ -2012,20 +2917,12 @@ namespace nnforge
                                 //std::cout << grid[0] << " " << grid[1] << " " << std::endl;
                                 block[0]=kernel_dims.second.x; block[1]=kernel_dims.second.y; block[2]=kernel_dims.second.z;
                                 KernelIdentifier kid("convolution_update_weights_exact_upd_kernel_kepler", grid, block);
-                                //EvqueueLaunch(kid);
-
                                 struct timeval start, end;
-                                //cudaDeviceSynchronize();
                                 //gettimeofday(&start, NULL);
-				//launch_update_kernel(dimension_count, window_sizes[0]);
                                 //cudaDeviceSynchronize();
                                 //gettimeofday(&end, NULL);
                                 //std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
                                 
-                                //convolution_update_weights_exact_upd_kernel_kepler_instrumented<dimension_count,3><<<kernel_dims.first, kernel_dims.second, 0, stream_id>>>(*gradient[0], input_tex, output_tex, packed_config_list, output_sizes, input_sizes, window_sizes, left_zero_padding, input_configuration_specific.feature_map_count, output_configuration_specific.feature_map_count, input_configuration_specific_striped.feature_map_count, output_configuration_specific_striped.feature_map_count, input_elem_count_per_entry_striped, output_elem_count_per_entry_striped, entry_count, updater_packed_config_count, updater_last_dimension_group_count); 
-
-                                unsigned int launch_ctr = 0;
-
                                 if(allocate == 0)
                                 {
                                 cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
@@ -2033,49 +2930,63 @@ namespace nnforge
                                 allocate = 1;
                                 }
 
-                                /*if((grid[0]==384)&&(counts_three<3))
-                                {
-                                   counts_three++;
-                                }*/
                                 unsigned long have_run_for=0;
 
-                                //if((grid[0]==12)||(grid[0]==48)||(grid[0]==96)||(grid[0]==192)||(counts_three==3))
-                                //{
-                                    //if(counts_three == 3)
-                                       //counts_three = 0;
-                                while(h_yield_point < grid[0]*grid[1]-1)
+                                h_yield_point = 0;
+                                update_weights_kernel_ctr++;
+                                bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
+                                if(update_weights_kernel_ctr%8==7)
                                 {
-                                    //cudaDeviceSynchronize();
-                                    //EvqueueLaunch(kid, have_run_for);
-                                    unsigned long allotted_slice=10000000000; //10s, surely can't exceed this
-                                    //gettimeofday(&start, NULL);
-                                    launch_update_kernel(dimension_count, window_sizes[0]);
-                                    break;
-                                    launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
-				    //launch_ctr++;
-                                    //cudaDeviceSynchronize();
-                                    //std::cout << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
-                                    cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                                    //gettimeofday(&end, NULL);
-                                    cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-                                    have_run_for = h_elapsed;
-                                    if(h_yield_point < grid[0]*grid[1]-1)
-                                    {
-                                       std::cout << h_yield_point << " " << grid[0]*grid[1]-1 << " " << h_elapsed << std::endl;
-                                    }
-				    //std::cout << launch_ctr << " => " << h_yield_point << " " << h_elapsed << " " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
+                                     yield_global_select = true;
+                                     yield_local_select = true;
+                                }
+                                long service_id=-1, service_id_dummy=-1;
+				while(h_yield_point < grid[0]*grid[1]-1)
+				{
+					if(yield_global)
+					{
+						if(h_yield_point == 0)
+						{
+							service_id = EvqueueLaunch(kid, have_run_for, service_id_dummy);
+							std::cout << "New UWE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id != -1);
+						}
+						else
+						{
+							service_id_dummy = EvqueueLaunch(kid, have_run_for, service_id);
+							std::cout << "In service UWE " << h_yield_point << " " << service_id << std::endl;
+							assert(service_id_dummy == -1);
+						}
+						assert(service_id != -1);
+					}
+                                        if(yield_local && yield_local_select)
+                                        {
+                                                assert(yield_global == false);
+						std::cout << "UWE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+					}
+					else if(yield_global && yield_global_select && (service_id != 10000000))
+					{
+                                                assert(yield_local == false);
+						std::cout << "UWE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						have_run_for += h_elapsed;
+					}
+					else
+					{
+						std::cout << "UWE default " << grid[0]*grid[1]-1 << std::endl;
+						launch_update_kernel(dimension_count, window_sizes[0]);
+						break;
+					}
                                 }
                                 h_yield_point = 0;
-                                //}
-                                //else
-                                //{
-                                   //unsigned int allotted_slice=200000000;
-                                   //EvqueueLaunch(kid, have_run_for);
-				   //launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
-                                   //cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                                   //cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-                                   //have_run_for = h_elapsed;
-                                //}
 			}
 
 		protected:

@@ -782,7 +782,7 @@ namespace nnforge
                                                 //CUPTI_CALL(cuptiActivityFlushAll(0));
 						gettimeofday(&end1, NULL);
                                                 //std::cout << (end1.tv_sec - start1.tv_sec)*1000000 + (end1.tv_usec - start1.tv_usec) << std::endl;
-						EvqueueSynch();
+						//EvqueueSynch();
 					} // while(base_input_entry_id < entries_available_for_processing_count)
                                         //gettimeofday(&start, NULL);
 
@@ -808,7 +808,7 @@ namespace nnforge
 				current_data_slot = 1 - current_data_slot;
 				current_command_slot = 1 - current_command_slot;
                                 //evqm->synch();
-                                EvqueueSynch();
+                                //EvqueueSynch();
 				gettimeofday(&end, NULL);
                                 std::cerr << "[NN] ------ " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << std::endl;
 			}
