@@ -42,13 +42,14 @@
 #define MAX_WINDOW_WIDTH 10
 
 //extern EvqueueManager *evqm;
-__device__ unsigned long long int d_zero_clock[15]; 
-__device__ unsigned int d_yield_point, d_yield_point_persist, d_yield;
+__device__ unsigned long long int d_zero_clock[15];
+__device__ unsigned int d_yield; 
+__device__ int d_yield_point, d_yield_point_persist;
 __device__ unsigned int d_clock_initialized[15];
 __device__ int d_elapsed;
-unsigned int h_yield_point;
+int h_yield_point;
 int h_elapsed;
-unsigned int *d_yield_point_ret;
+int *d_yield_point_ret;
 int *d_elapsed_ret;
 int counts_three, allocate;
 int backprop_kernel_ctr, update_kernel_ctr, update_weights_kernel_ctr;
@@ -67,16 +68,60 @@ namespace nnforge
 	    return smid;
     }
  
-    static __device__ __forceinline__ uint32_t yield(unsigned int *d_ret1, int *d_ret2, unsigned int allotted_slice)
+    static __device__ __forceinline__ uint32_t yield(int *d_ret1, int *d_ret2, unsigned int allotted_slice)
     {
 	    __shared__ bool yield;
-	    int elapsed = 0;
+	    int elapsed = -1;
 	    unsigned long long int start_clock = clock64();
 	    int mysmid = __smid();
 	    if(threadIdx.x == 0)
 	    {
-		    if(blockIdx.x + blockIdx.y * gridDim.x < 60)
+		    if(blockIdx.x + blockIdx.y * gridDim.x < 15)
 		    {
+			if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
+			{
+				atomicExch(&d_zero_clock[mysmid], start_clock);
+				elapsed = start_clock - d_zero_clock[mysmid];
+                                //printf("%d %d\n", blockIdx.x, elapsed);
+                        }
+			else
+			{
+				elapsed = start_clock - d_zero_clock[mysmid];
+                                //printf("%d %d\n", blockIdx.x, elapsed);
+			}
+                        if(elapsed > 10000) /*scheduler launch unlikely to take 10us, so can only launch something less than 60*/
+                        {
+                                printf("LESS BAD %d %d\n", blockIdx.x + blockIdx.y * gridDim.x, elapsed);
+                        }
+			if(d_yield_point_persist >= 14)
+			{
+				yield = true;
+			}
+			else
+			{
+				yield = false;
+				atomicMax(&d_yield_point, blockIdx.x + blockIdx.y * gridDim.x);
+				atomicMax(&d_elapsed, elapsed);
+			}
+			if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
+			{   
+                                //printf("FIRST %d %d\n", d_yield_point, d_elapsed);
+                                //printf("LAST %d %d %d %d %d\n", elapsed, yield, d_yield_point_persist, d_yield_point, d_elapsed);
+				int val = atomicExch(&d_yield_point, 0);
+				if(val == gridDim.x * gridDim.y - 1)
+					atomicExch(&d_yield_point_persist, 0);
+				else
+					atomicExch(&d_yield_point_persist, val);
+				*d_ret1 = val;
+				val = atomicExch(&d_elapsed, 0);
+				*d_ret2 = val;
+				for(int i=0; i<15; i++)
+				{
+					atomicExch(&d_clock_initialized[i],0);
+					unsigned int val = atomicExch(&d_clock_initialized[i],0);
+				}
+			}
+                     #if 0
 
 			    if(atomicCAS(&d_clock_initialized[mysmid], 0, 1)==0)
 			    {
@@ -97,16 +142,22 @@ namespace nnforge
 					    yield = true;
 				    }
 			    }
+                     #endif
 		    }
 		    else
 		    {
-			    if(blockIdx.x + blockIdx.y * gridDim.x < d_yield_point_persist)
+				    elapsed = start_clock - d_zero_clock[mysmid];
+                        if(elapsed <= 1000) /*1us is a tighter limit suitable for high occupancy like 120 or 240, can launch more than 15 when GPU is free*/
+                        {
+                                //printf("MORE DON'T CARE %d %d\n", blockIdx.x + blockIdx.y * gridDim.x, elapsed);
+                        }
+			    if(blockIdx.x + blockIdx.y * gridDim.x <= d_yield_point_persist)
 			    {
 				    yield = true;
 			    }
 			    else
 			    {
-				    elapsed = start_clock - d_zero_clock[mysmid];
+				    //elapsed = start_clock - d_zero_clock[mysmid];
 				    if(elapsed >= allotted_slice/*20000000*/)
 				    {
 					    yield = true;
@@ -122,6 +173,7 @@ namespace nnforge
 
 			    if(blockIdx.x + blockIdx.y * gridDim.x == gridDim.x * gridDim.y - 1)
 			    {
+                                    //printf("SECOND ON %d %d\n", d_yield_point, d_elapsed);
 				    unsigned int val = atomicExch(&d_yield_point, 0);
 
 				    if(val == gridDim.x * gridDim.y - 1)
@@ -322,7 +374,7 @@ namespace nnforge
 			int packed_config_count,
 			int input_feature_map_group_size,/*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                         if(yield(d_ret1, d_ret2, allotted_slice))
@@ -626,7 +678,7 @@ namespace nnforge
 			int packed_config_count,
 			int input_feature_map_group_size,/*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                         if(yield(d_ret1, d_ret2, allotted_slice))
@@ -934,7 +986,7 @@ namespace nnforge
 			int packed_config_count,
 			int output_feature_map_group_size,/*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                         if(yield(d_ret1, d_ret2, allotted_slice))
@@ -1245,7 +1297,7 @@ namespace nnforge
 			int packed_config_count,
 			int output_feature_map_group_size, /*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                         if(yield(d_ret1, d_ret2, allotted_slice))
@@ -1598,7 +1650,7 @@ namespace nnforge
 			int packed_config_count,
 			int last_dimension_group_count,/*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                         if(yield(d_ret1, d_ret2, allotted_slice))
@@ -2015,7 +2067,7 @@ namespace nnforge
 			int packed_config_count,
 			int last_dimension_group_count,/*)*/
                         unsigned long allotted_slice,
-                        unsigned int *d_ret1,
+                        int *d_ret1,
                         int *d_ret2)
 		{
                      #if 0
@@ -2677,7 +2729,7 @@ namespace nnforge
                                 KernelIdentifier kid("convolution_tex_exact_blocked_upd_kernel_kepler", grid, block);
                                 if(allocate == 0)
                                 {
-                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_yield_point_ret, sizeof(int));
                                 cudaMalloc(&d_elapsed_ret, sizeof(int));
                                 allocate = 1;
                                 }
@@ -2685,11 +2737,25 @@ namespace nnforge
                                 unsigned long have_run_for=0;
 
                                 h_yield_point = 0;
+                                h_elapsed = -2;
+                                int t=-2;
+				cudaMemcpy(d_yield_point_ret, &t, sizeof(int), cudaMemcpyHostToDevice);
+				cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
                                 update_kernel_ctr++;
                                 bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
+                                if(/*update_kernel_ctr%8==6*/true)
+                                {
+                                     yield_global_select = true;
+                                     yield_local_select = true;
+                                }
                                 long service_id=-1, service_id_dummy=-1;
+                                int progress_checker = 0;
+				//std::cout << "ue before loop " << h_yield_point << " " << grid[0]*grid[1]-1 << std::endl;
 				while(h_yield_point < grid[0]*grid[1]-1)
 				{
+					//std::cout << "ue inside loop " << grid[0]*grid[1]-1 << std::endl;
+                                        progress_checker++;
+                                        assert(progress_checker<1000);
 					if(yield_global)
 					{
 						if(h_yield_point == 0)
@@ -2708,20 +2774,37 @@ namespace nnforge
 					}
 					if(yield_local && yield_local_select)
 					{
+						//std::cout << "ue local " << grid[0]*grid[1]-1 << std::endl;
+						struct timeval start, end;
                                                 assert(yield_global == false);
-						std::cout << "UE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						//std::cout << "UE instrumented " << grid[0]*grid[1]-1 << std::endl;
+						unsigned long allotted_slice=128000000; /*10000000000;*/ //10s, surely can't exceed this
+                                                int t_yield_point = -2, t_elapsed = -2;
+						cudaMemcpy(d_yield_point_ret, &h_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_yield_point, &t_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_elapsed, &t_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+                                                t_yield_point = 0; t_elapsed = 0;
+						gettimeofday(&start, NULL);
 						launch_kernel_instrumented(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count, allotted_slice);
-						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						gettimeofday(&end, NULL);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-						have_run_for += h_elapsed;
+						cudaMemcpy(&t_yield_point, &d_yield_point, sizeof(int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&t_elapsed, &d_elapsed, sizeof(int), cudaMemcpyDeviceToHost);
+						//std::cout << "ue " << " " << h_yield_point << " " << h_elapsed << " " << grid[0]*grid[1] << " " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << " " << t_yield_point << " " << t_elapsed << std::endl;
+						assert(h_elapsed != -2);
+						assert(t_elapsed != -2);
+						assert(t_yield_point != -2);
+						//have_run_for += h_elapsed;
+						h_elapsed = -2;
 
 					}
 					else if(yield_global && yield_global_select && (service_id != 10000000))
 					{
+						//std::cout << "ue global " << grid[0]*grid[1]-1 << std::endl;
                                                 assert(yield_local == false);
-						std::cout << "UE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						unsigned long allotted_slice=10000000; /*10000000000;*/ //10s, surely can't exceed this
 						launch_kernel_instrumented(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count, allotted_slice);
 						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
@@ -2730,11 +2813,12 @@ namespace nnforge
 					}
 					else
 					{
-						std::cout << "UE default " << grid[0]*grid[1]-1 << std::endl;
+						//std::cout << "ue default " << grid[0]*grid[1]-1 << std::endl;
 						launch_kernel(dimension_count, window_sizes[0], forward_x_block_size, single_input_feature_map_group_count);
 						break;
 					}
                                 }
+				//std::cout << "ue after loop " << grid[0]*grid[1]-1 << std::endl;
                                 h_yield_point = 0;
 			}
 
@@ -2787,7 +2871,7 @@ namespace nnforge
                                 KernelIdentifier kid("convolution_backprop_tex_exact_blocked_upd_kernel_kepler", grid, block);
                                 if(allocate == 0)
                                 {
-                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_yield_point_ret, sizeof(int));
                                 cudaMalloc(&d_elapsed_ret, sizeof(int));
                                 allocate = 1;
                                 }
@@ -2795,17 +2879,26 @@ namespace nnforge
                                 unsigned long have_run_for=0;
 
                                 h_yield_point = 0;
+                                h_elapsed = -2;
+                                int t=-2;
+				cudaMemcpy(d_yield_point_ret, &t, sizeof(int), cudaMemcpyHostToDevice);
+				cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
                                 backprop_kernel_ctr++;
                                 bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
 				//std::cout << "BPE " << backprop_kernel_ctr << " " << grid[0]*grid[1]-1 << std::endl;
-                                /*if((backprop_kernel_ctr%7==3)||(backprop_kernel_ctr%7==4)||(backprop_kernel_ctr%7==6))
+                                if(true/*(backprop_kernel_ctr%7==3)*//*||(backprop_kernel_ctr%7==4)||(backprop_kernel_ctr%7==6)*/)
                                 {
                                       yield_global_select = true;
                                       yield_local_select = true;
-                                }*/
+                                }
 				long service_id = -1, service_id_dummy = -1;
+                                int progress_checker = 0;
+				//std::cout << "bpe before loop " << h_yield_point << " " << grid[0]*grid[1]-1 << std::endl;
                                 while(h_yield_point < grid[0]*grid[1]-1)
 				{
+					//std::cout << "bpe inside loop " << grid[0]*grid[1]-1 << std::endl;
+                                        progress_checker++;
+                                        assert(progress_checker<1000);
 					if(yield_global)
 					{
 						if(h_yield_point == 0)
@@ -2824,20 +2917,35 @@ namespace nnforge
 					}
                                         if(yield_local && yield_local_select)
                                         {
+						//std::cout << "bpe local " << grid[0]*grid[1]-1 << std::endl;
+						struct timeval start, end;
                                                 assert(yield_global == false);
-						std::cout << "BPE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						unsigned long allotted_slice=128000000; /*10000000000;*/ //10s, surely can't exceed this
+                                                int t_yield_point = -2, t_elapsed = -2;
+						cudaMemcpy(d_yield_point_ret, &h_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_yield_point, &t_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_elapsed, &t_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+                                                t_yield_point = 0; t_elapsed = 0;
+						gettimeofday(&start, NULL);
 						launch_backprop_kernel_instrumented(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count, allotted_slice);
-						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						gettimeofday(&end, NULL);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-						have_run_for += h_elapsed;
-
+						cudaMemcpy(&t_yield_point, &d_yield_point, sizeof(int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&t_elapsed, &d_elapsed, sizeof(int), cudaMemcpyDeviceToHost);
+						//std::cout << "bpe " << " " << h_yield_point << " " << h_elapsed << " " << grid[0]*grid[1] << " " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << " " << t_yield_point << " " << t_elapsed << std::endl;
+						assert(h_elapsed != -2);
+						assert(t_elapsed != -2);
+						assert(t_yield_point != -2);
+						//have_run_for += h_elapsed;
+						h_elapsed = -2;
                                         }
 					else if(yield_global && yield_global_select && (service_id != 10000000))
 					{
+						//std::cout << "bpe global " << grid[0]*grid[1]-1 << std::endl;
                                                 assert(yield_local == false);
-						std::cout << "BPE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						unsigned long allotted_slice=10000000; /*10000000000;*/ //10s, surely can't exceed this
 						launch_backprop_kernel_instrumented(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count, allotted_slice);
 						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
@@ -2846,11 +2954,12 @@ namespace nnforge
 					}
 					else
 					{
-						std::cout << "BPE default " << grid[0]*grid[1]-1 << std::endl;
+						//std::cout << "bpe default " << grid[0]*grid[1]-1 << std::endl;
 						launch_backprop_kernel(dimension_count, window_sizes[0], backward_x_block_size, single_output_feature_map_group_count);
 						break;
 					}
 				}
+				//std::cout << "bpe after loop " << grid[0]*grid[1]-1 << std::endl;
                                 h_yield_point = 0;
 			}
 
@@ -2925,7 +3034,7 @@ namespace nnforge
                                 
                                 if(allocate == 0)
                                 {
-                                cudaMalloc(&d_yield_point_ret, sizeof(unsigned int));
+                                cudaMalloc(&d_yield_point_ret, sizeof(int));
                                 cudaMalloc(&d_elapsed_ret, sizeof(int));
                                 allocate = 1;
                                 }
@@ -2933,16 +3042,25 @@ namespace nnforge
                                 unsigned long have_run_for=0;
 
                                 h_yield_point = 0;
+                                h_elapsed = -2;
+                                int t=-2;
+				cudaMemcpy(d_yield_point_ret, &t, sizeof(int), cudaMemcpyHostToDevice);
+				cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
                                 update_weights_kernel_ctr++;
                                 bool yield_global = false, yield_global_select = false, yield_local = true, yield_local_select = false;
-                                if(update_weights_kernel_ctr%8==7)
+                                if(/*(update_weights_kernel_ctr%8==7)||(update_weights_kernel_ctr%8==5)||(update_weights_kernel_ctr%8==3)*//*||(update_weights_kernel_ctr%8==0)*/true)
                                 {
                                      yield_global_select = true;
                                      yield_local_select = true;
                                 }
                                 long service_id=-1, service_id_dummy=-1;
+                                int progress_checker = 0;
+				//std::cout << "uwe before loop " << h_yield_point << " " << grid[0]*grid[1]-1 << std::endl;
 				while(h_yield_point < grid[0]*grid[1]-1)
 				{
+					//std::cout << "uwe inside loop " << grid[0]*grid[1]-1 << std::endl;
+                                        progress_checker++;
+                                        assert(progress_checker<1000);
 					if(yield_global)
 					{
 						if(h_yield_point == 0)
@@ -2961,19 +3079,35 @@ namespace nnforge
 					}
                                         if(yield_local && yield_local_select)
                                         {
+						//std::cout << "uwe local " << grid[0]*grid[1]-1 << std::endl;
+						struct timeval start, end;
                                                 assert(yield_global == false);
-						std::cout << "UWE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						unsigned long allotted_slice=128000000; /*10000000000;*/ //10s, surely can't exceed this
+                                                int t_yield_point = -2, t_elapsed = -2;
+						cudaMemcpy(d_yield_point_ret, &h_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(d_elapsed_ret, &h_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_yield_point, &t_yield_point, sizeof(int), cudaMemcpyHostToDevice);
+						cudaMemcpy(&d_elapsed, &t_elapsed, sizeof(int), cudaMemcpyHostToDevice);
+                                                t_yield_point = 0; t_elapsed = 0;
+						gettimeofday(&start, NULL);
 						launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
-						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(int), cudaMemcpyDeviceToHost);
+						gettimeofday(&end, NULL);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
-						have_run_for += h_elapsed;
+						cudaMemcpy(&t_yield_point, &d_yield_point, sizeof(int), cudaMemcpyDeviceToHost);
+						cudaMemcpy(&t_elapsed, &d_elapsed, sizeof(int), cudaMemcpyDeviceToHost);
+						//std::cout << "uwe " << " " << h_yield_point << " " << h_elapsed << " " << grid[0]*grid[1] << " " << (end.tv_sec - start.tv_sec)*1000000 + (end.tv_usec - start.tv_usec) << " " << t_yield_point << " " << t_elapsed << std::endl;
+						assert(h_elapsed != -2);
+						assert(t_elapsed != -2);
+						assert(t_yield_point != -2);
+						//have_run_for += h_elapsed;
+						h_elapsed = -2;
 					}
 					else if(yield_global && yield_global_select && (service_id != 10000000))
 					{
+						//std::cout << "uwe global " << grid[0]*grid[1]-1 << std::endl;
                                                 assert(yield_local == false);
-						std::cout << "UWE instrumented " << grid[0]*grid[1]-1 << std::endl;
-						unsigned long allotted_slice=20000000; /*10000000000;*/ //10s, surely can't exceed this
+						unsigned long allotted_slice=10000000; /*10000000000;*/ //10s, surely can't exceed this
 						launch_update_kernel_instrumented(dimension_count, window_sizes[0], allotted_slice);
 						cudaMemcpy(&h_yield_point, d_yield_point_ret, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 						cudaMemcpy(&h_elapsed, d_elapsed_ret, sizeof(int), cudaMemcpyDeviceToHost);
@@ -2981,11 +3115,12 @@ namespace nnforge
 					}
 					else
 					{
-						std::cout << "UWE default " << grid[0]*grid[1]-1 << std::endl;
+						//std::cout << "uwe default " << grid[0]*grid[1]-1 << std::endl;
 						launch_update_kernel(dimension_count, window_sizes[0]);
 						break;
 					}
                                 }
+				//std::cout << "uwe after loop " << grid[0]*grid[1]-1 << std::endl;
                                 h_yield_point = 0;
 			}
 
